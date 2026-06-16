@@ -4,8 +4,10 @@ import io
 import math
 import re
 import zipfile
+import argparse
 from collections import Counter
-from datetime import datetime
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 import pandas as pd
@@ -554,6 +556,55 @@ def create_excel_with_analysis(uploaded_file: Any) -> bytes:
     return output.read()
 
 
+class LocalUpload:
+    def __init__(self, path: Path):
+        self.path = path
+        self.filename = path.name
+
+    def read(self) -> bytes:
+        return self.path.read_bytes()
+
+
+def convert_local_files(input_paths: list[Path], output_zip: Path) -> tuple[int, int]:
+    output_zip.parent.mkdir(parents=True, exist_ok=True)
+    report_lines = [
+        "HBL-BMS Trending Local Conversion Report",
+        f"Generated: {datetime.now(UTC).isoformat(timespec='seconds')}",
+        "",
+    ]
+    success_count = 0
+    fail_count = 0
+
+    with zipfile.ZipFile(output_zip, "w", zipfile.ZIP_DEFLATED) as archive:
+        for path in input_paths:
+            print(f"Processing {path}...")
+            if not path.exists():
+                fail_count += 1
+                report_lines.append(f"FAILED: {path} - file not found")
+                continue
+            if path.suffix.lower() != ".csv":
+                fail_count += 1
+                report_lines.append(f"FAILED: {path.name} - not a CSV file")
+                continue
+
+            try:
+                workbook_bytes = create_excel_with_analysis(LocalUpload(path))
+                output_name = f"{path.stem}.xlsx"
+                archive.writestr(output_name, workbook_bytes)
+                success_count += 1
+                report_lines.append(f"OK: {path.name} -> {output_name} ({len(workbook_bytes):,} bytes)")
+                print(f"  OK -> {output_name} ({len(workbook_bytes):,} bytes)")
+            except Exception as exc:
+                fail_count += 1
+                report_lines.append(f"FAILED: {path.name} - {exc}")
+                print(f"  FAILED: {exc}")
+
+        report_lines.extend(["", f"Successful files: {success_count}", f"Failed files: {fail_count}"])
+        archive.writestr("conversion_report.txt", "\n".join(report_lines))
+
+    return success_count, fail_count
+
+
 @app.post("/api/convert")
 @app.post("/")
 def convert() -> Response:
@@ -572,7 +623,7 @@ def convert() -> Response:
     zip_buffer = io.BytesIO()
     report_lines = [
         "HBL-BMS Trending Conversion Report",
-        f"Generated: {datetime.utcnow().isoformat(timespec='seconds')} UTC",
+        f"Generated: {datetime.now(UTC).isoformat(timespec='seconds')}",
         "",
     ]
     success_count = 0
@@ -602,3 +653,19 @@ def convert() -> Response:
     response = Response(zip_buffer.read(), mimetype="application/zip")
     response.headers["Content-Disposition"] = 'attachment; filename="hbl-bms-trend-analysis.zip"'
     return response
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Convert local BMS / ACMV trend CSV files to analyzed Excel workbooks.")
+    parser.add_argument("inputs", nargs="+", help="CSV file paths to convert locally.")
+    parser.add_argument("--out", default="hbl-bms-trend-analysis.zip", help="Output ZIP path.")
+    args = parser.parse_args()
+
+    success_count, fail_count = convert_local_files([Path(path) for path in args.inputs], Path(args.out))
+    print(f"Done. Successful files: {success_count}. Failed files: {fail_count}.")
+    print(f"Output: {Path(args.out).resolve()}")
+    return 0 if success_count > 0 else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
