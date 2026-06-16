@@ -1,0 +1,6 @@
+{
+  "name": "CSV Fast View Converter",
+  "description": "Convert multiple CSV files into clean, processed Excel .xlsx sheets and download them all in a single ZIP file, directly in the browser.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}
