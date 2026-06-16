@@ -1,16 +1,17 @@
 # CSV Fast View Converter
 
-A browser-only CSV to Excel converter for telemetry, trend, and log files. Files are parsed locally in the browser, cleaned, converted to `.xlsx`, and optionally downloaded as a ZIP batch.
+React + Vite frontend with a Python serverless backend for BMS / ACMV trend analysis. The UI uploads CSV files to `/api/convert`; Python cleans the data, classifies HVAC trend columns, creates engineering analysis sheets and embedded Excel charts, then returns a ZIP package.
 
 ## Features
 
 - Batch CSV upload with drag and drop
-- Automatic separator detection for comma, semicolon, tab, and pipe-delimited files
-- Header cleanup and duplicate column name handling
-- Empty row and empty column pruning
-- Numeric, boolean, and date value casting for Excel
-- Single-file `.xlsx` downloads and ZIP batch export
-- Client-side processing with no server upload step
+- Python backend conversion via `POST /api/convert`
+- BMS / ACMV keyword-based column classification
+- Date/time detection and sorting
+- Numeric and status analysis tables
+- Excel workbooks with visible `Data` and `Analysis` sheets only
+- Hidden `_ChartHelper` sheet for embedded Excel charts
+- ZIP output with converted workbooks and `conversion_report.txt`
 
 ## Local Development
 
@@ -18,6 +19,7 @@ Prerequisite: Node.js 20 or newer.
 
 ```bash
 npm install
+python3 -m pip install -r requirements.txt
 npm run dev
 ```
 
@@ -30,7 +32,8 @@ npm run build
 
 ## Vercel
 
-This is a static Vite app. Vercel can deploy it with:
+Vercel deploys the Vite frontend and Python serverless function:
 
 - Build command: `npm run build`
 - Output directory: `dist`
+- API endpoint: `/api/convert`

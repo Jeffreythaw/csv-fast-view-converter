@@ -2,7 +2,7 @@
   "name": "csv-fast-view-converter",
   "private": true,
   "version": "0.0.0",
-  "description": "Client-side CSV to XLSX batch converter for telemetry and log files.",
+  "description": "React UI for a Python-powered BMS / ACMV trend analyzer.",
   "type": "module",
   "scripts": {
     "dev": "vite --port=3000 --host=0.0.0.0",
@@ -14,12 +14,10 @@
   "dependencies": {
     "@tailwindcss/vite": "^4.1.14",
     "@vitejs/plugin-react": "^5.0.4",
-    "jszip": "^3.10.1",
     "lucide-react": "^0.546.0",
     "react": "^19.0.1",
     "react-dom": "^19.0.1",
-    "vite": "^6.2.3",
-    "xlsx-js-style": "^1.2.0"
+    "vite": "^6.2.3"
   },
   "devDependencies": {
     "@types/node": "^22.14.0",
