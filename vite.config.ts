@@ -9,6 +9,7 @@ export default defineConfig(() => {
     resolve: {
       alias: {
         '@': path.resolve(__dirname, '.'),
+        stream: path.resolve(__dirname, 'src/utils/browserStreamShim.ts'),
       },
     },
     server: {

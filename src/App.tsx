@@ -6,113 +6,19 @@
 import React, { useState, useRef, useMemo } from 'react';
 import { 
   FileSpreadsheet, 
-  Upload, 
   Download, 
   FileUp, 
-  Sparkles, 
-  CheckCircle2, 
   AlertCircle, 
   RefreshCw, 
-  Layers, 
-  Cpu, 
-  Server, 
   Info, 
-  HelpCircle, 
   Trash2, 
-  FileArchive,
   Check,
-  ArrowRight,
-  CodeXml,
-  Terminal,
-  ShieldCheck,
-  CalendarDays,
-  Binary,
   Activity,
   FileCheck2,
-  ExternalLink,
-  ChevronRight,
-  ShieldAlert,
-  HardDrive
+  ShieldAlert
 } from 'lucide-react';
 import JSZip from 'jszip';
 import { processCSVFile, ProcessingResult } from './utils/csvProcessor';
-
-// Statics for Vercel compatibility checks
-interface VercelCheckItem {
-  id: string;
-  title: string;
-  query: string;
-  status: 'compatible' | 'warning' | 'restricted';
-  details: string;
-  solution: string;
-}
-
-const VERCEL_CHECKS: VercelCheckItem[] = [
-  {
-    id: 'compatibility',
-    title: 'Serverless Route Compatibility',
-    query: '1. Whether the API route is compatible with Vercel.',
-    status: 'compatible',
-    details: 'Next.js App Router API handlers (POST /api/convert) are natively supported on Vercel as serverless micro-functions. They handle Multipart FormData buffers statelessly and scale automatically.',
-    solution: 'Implement clean API route directory trees under `/app/api/convert/route.ts`.'
-  },
-  {
-    id: 'payload-size',
-    title: 'Request Payload Size Restrictions',
-    query: '2. Whether the file size may exceed Vercel limits.',
-    status: 'restricted',
-    details: 'Vercel enforces a strict 4.5 MB request and response body size cap on Serverless Functions. Passing raw multi-megabyte SCADA telemetry or high-frequency BMS trend logs will trigger client-side HTTP 413 Payload Too Large errors.',
-    solution: 'Deploy client-side in-memory translation (the default mode of this app) for files exceeding 4.5 MB, which circumvents network and server limits completely!'
-  },
-  {
-    id: 'timeouts',
-    title: 'Serverless CPU Timeout Budgets',
-    query: '3. Whether serverless timeout may be an issue.',
-    status: 'warning',
-    details: 'Vercel Hobby tier has a rigid 10-second timeout budget (Pro tier has up to 60s). Dense spreadsheets requiring statistical analysis or extensive ZIP compression algorithms can easily trigger a 504 Gateway Timeout error on Vercel.',
-    solution: 'Isolate operations, clean rows sequentially, and prioritize browser Web Workers or direct client processing for dense inputs.'
-  },
-  {
-    id: 'edge-runtime',
-    title: 'Vercel Edge Runtime Constraints',
-    query: '4. Whether Edge Runtime should be avoided.',
-    status: 'restricted',
-    details: 'The Edge Runtime is specialized for light geopairing and has thin 50MB memory capsules. It disables native Node.js globals. SheetJS (xlsx) requires broad UTF-8 strings and complex buffer routines to compile binary Excel files, raising critical run exceptions under Edge.',
-    solution: 'Avoid using Node Edge Runtime for Excel processing. Run the standard, full-featured Node Serverless Runtime.'
-  },
-  {
-    id: 'node-runtime',
-    title: 'Node.js Runtime Suitability',
-    query: '5. Whether Node.js runtime should be used.',
-    status: 'compatible',
-    details: 'Standard Node.js runtime gives your functions full access to standard streams, structured ArrayBuffers, and broad maximum memory caps supporting binary conversions.',
-    solution: 'Configure Next.js to use the standard nodejs runtime for memory-intensive routines.'
-  },
-  {
-    id: 'runtime-config',
-    title: 'Active Runtime Configuration',
-    query: '6. How to set runtime configuration.',
-    status: 'compatible',
-    details: 'Export specific config flags directly inside your Next.js route file. This instructs the Vercel compiler to deploy with elevated parameters.',
-    solution: 'Export code declarations: `export const runtime = "nodejs";` and `export const maxDuration = 60;`.'
-  },
-  {
-    id: 'file-handling',
-    title: 'Stateless In-Memory File Streams',
-    query: '7. How to handle files safely.',
-    status: 'compatible',
-    details: 'Vercel deployment containers execute on stateless, read-only file architectures. Attempting to write files using file system packages (like fs.writeFile) in directories other than /tmp will crash immediately.',
-    solution: 'Safely parse and compile spreadsheets inside memory arrays (as Buffers & Uint8Arrays) and stream them back immediately without disk writing.'
-  },
-  {
-    id: 'error-handling',
-    title: 'Graceful Error Diagnostics',
-    query: '8. How to show useful errors to users.',
-    status: 'compatible',
-    details: 'Uncaught exceptions on serverless environments look like cold 500 Vercel crashes. BMS and mechanical engineers need precise diagnostics to troubleshoot telemetry structural files.',
-    solution: 'Enclose compiling loops inside robust try-catch exceptions, responding with structured JSON responses containing custom error messages and helpful advice.'
-  }
-];
 
 interface QueueItem {
   id: string;
@@ -128,8 +34,6 @@ export default function App() {
   const [isProcessing, setIsProcessing] = useState(false);
   const [isZipping, setIsZipping] = useState(false);
   const [dragActive, setDragActive] = useState(false);
-  const [activeTab, setActiveTab] = useState<'converter' | 'specs' | 'api-code'>('converter');
-  const [selectedInspectCheck, setSelectedInspectCheck] = useState<string>('compatibility');
   
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -288,7 +192,7 @@ export default function App() {
             return { 
               ...item, 
               status: 'completed', 
-              progressMessage: 'Successfully parsed and optimized.',
+              progressMessage: 'Workbook ready with summary, profile, filters, and frozen data header.',
               metadata 
             };
           }
@@ -411,10 +315,6 @@ export default function App() {
     return Math.round((processed / totalFiles) * 100);
   }, [queue, totalFiles]);
 
-  const activeInspectItem = useMemo(() => {
-    return VERCEL_CHECKS.find(c => c.id === selectedInspectCheck) || VERCEL_CHECKS[0];
-  }, [selectedInspectCheck]);
-
   return (
     <div className="min-h-screen bg-slate-50 text-slate-900 antialiased font-sans flex flex-col selection:bg-indigo-100" id="main_app_layout">
       
@@ -442,54 +342,12 @@ export default function App() {
             <span className="text-indigo-650 font-semibold">100% Client Isolation</span>
           </div>
 
-          {/* Clean Engineering Tab System */}
-          <nav className="flex bg-slate-100 p-1 rounded-lg border border-slate-200 shrink-0">
-            <button
-              onClick={() => setActiveTab('converter')}
-              className={`flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-md transition-all cursor-pointer ${
-                activeTab === 'converter' 
-                  ? 'bg-white text-slate-900 shadow-xs border border-slate-200/80' 
-                  : 'text-slate-500 hover:text-slate-900'
-              }`}
-              id="converter_tab_btn"
-            >
-              <Cpu className="w-3.5 h-3.5 text-indigo-600" />
-              Batch Processor
-            </button>
-            <button
-              onClick={() => setActiveTab('specs')}
-              className={`flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-md transition-all cursor-pointer ${
-                activeTab === 'specs' 
-                  ? 'bg-white text-slate-900 shadow-xs border border-slate-200/80' 
-                  : 'text-slate-500 hover:text-slate-900'
-              }`}
-              id="specs_tab_btn"
-            >
-              <Layers className="w-3.5 h-3.5 text-indigo-600" />
-              Pipeline Specs
-            </button>
-            <button
-              onClick={() => setActiveTab('api-code')}
-              className={`flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-md transition-all cursor-pointer ${
-                activeTab === 'api-code' 
-                  ? 'bg-white text-slate-900 shadow-xs border border-slate-200/80' 
-                  : 'text-slate-500 hover:text-slate-900'
-              }`}
-              id="api_btn"
-            >
-              <Terminal className="w-3.5 h-3.5 text-indigo-600" />
-              Vercel Blueprint & Specs
-            </button>
-          </nav>
         </div>
       </header>
 
       {/* Main Container */}
       <main className="flex-1 max-w-7xl mx-auto w-full px-4 sm:px-6 lg:px-8 py-8">
-        
-        {/* TAB 1: CONVERTER WORKSPACE */}
-        {activeTab === 'converter' && (
-          <div className="grid grid-cols-1 lg:grid-cols-12 gap-8" id="workspace_grid">
+        <div className="grid grid-cols-1 lg:grid-cols-12 gap-8" id="workspace_grid">
             
             {/* Left/Main Column: Ingestion and Queue */}
             <div className="lg:col-span-8 flex flex-col gap-6">
@@ -539,11 +397,11 @@ export default function App() {
                   </span>
                   <span>•</span>
                   <span className="flex items-center gap-1">
-                    <Check className="w-3 h-3 text-emerald-500" /> Header Sanity
+                    <Check className="w-3 h-3 text-emerald-500" /> Frozen Headers
                   </span>
                   <span>•</span>
                   <span className="flex items-center gap-1">
-                    <Check className="w-3 h-3 text-emerald-500" /> Zero RAM Hoarding
+                    <Check className="w-3 h-3 text-emerald-500" /> Summary Sheets
                   </span>
                 </div>
               </div>
@@ -605,7 +463,7 @@ export default function App() {
                           ) : (
                             <>
                               <RefreshCw className="w-3.5 h-3.5" />
-                              Convert to Excel (.xlsx)
+                              Convert to Styled Excel (.xlsx)
                             </>
                           )}
                         </button>
@@ -624,7 +482,7 @@ export default function App() {
                           ) : (
                             <>
                               <Download className="w-3.5 h-3.5" />
-                              Download ZIP ({successCount})
+                              Download Styled ZIP ({successCount})
                             </>
                           )}
                         </button>
@@ -738,7 +596,7 @@ export default function App() {
                               title="Download single .xlsx"
                             >
                               <Download className="w-3.5 h-3.5" />
-                              <span>Excel</span>
+                              <span>Workbook</span>
                             </button>
                           )}
                           <button
@@ -826,7 +684,7 @@ export default function App() {
                             id="download_zip_widget_button"
                           >
                             <Download className="w-4 h-4" />
-                            <span>Download Cleansed ZIP Pack</span>
+                            <span>Download Styled Workbook Pack</span>
                           </button>
                         )}
                       </div>
@@ -877,287 +735,13 @@ export default function App() {
                 <div>
                   <h4 className="font-bold text-indigo-950">Local Memory Isolation</h4>
                   <p className="mt-1 leading-relaxed text-indigo-850">
-                    Because Excel files are fully parsed and compiled in the local sandbox thread of your browser, there is zero network transmission. Multi-megabyte BMS files never travel online, avoiding serverless timeout limits entirely.
+                    Excel workbooks are parsed and compiled inside your browser. Each output includes a clean data sheet, summary sheet, column profile, and chart-ready ranges without uploading files to a server.
                   </p>
                 </div>
               </div>
 
             </div>
-          </div>
-        )}
-
-        {/* TAB 2: PIPELINE SPECIFICATIONS */}
-        {activeTab === 'specs' && (
-          <div className="bg-white border border-slate-200 p-8 shadow-xs max-w-4xl mx-auto rounded-3xl" id="specs_container">
-            <div className="border-b border-slate-150 pb-5 mb-5">
-              <h2 className="text-lg font-bold text-slate-900 flex items-center gap-2">
-                <Layers className="w-5 h-5 text-indigo-600" />
-                Automatic Cleansing Pipeline Specifications
-              </h2>
-              <p className="text-xs text-slate-500 mt-1">High-performance processing stages mapped out for client-side execution buffers.</p>
-            </div>
-
-            <div className="space-y-6 text-xs text-slate-650 leading-relaxed">
-              <p className="text-[13px] text-slate-750 font-sans leading-relaxed">
-                To guarantee zero memory fragmentation and eliminate server performance bottlenecks, the pipeline uses modern array-of-array structures (AOA) with targeted sanitizer matrices:
-              </p>
-
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4 my-6">
-                <div className="bg-slate-50 border border-slate-200 p-4.5 rounded-xl">
-                  <div className="w-6 h-6 rounded-lg bg-slate-900 text-emerald-400 flex items-center justify-center font-mono text-[10px] font-bold mb-2">A</div>
-                  <strong className="text-slate-900 font-semibold block mb-1">Separator Matrix Detection</strong>
-                  <p className="text-[11px] text-slate-500 leading-relaxed">
-                    Runs frequency-score statistical checks against line samples. Safely ignores separators inside quoted blocks to detect tabs, semicolons, commas, or pipes automatically.
-                  </p>
-                </div>
-
-                <div className="bg-slate-50 border border-slate-200 p-4.5 rounded-xl">
-                  <div className="w-6 h-6 rounded-lg bg-slate-900 text-indigo-400 flex items-center justify-center font-mono text-[10px] font-bold mb-2">B</div>
-                  <strong className="text-slate-900 font-semibold block mb-1">Header Cleansing Matrix</strong>
-                  <p className="text-[11px] text-slate-500 leading-relaxed">
-                    Removes carriage line breaks, trim whitespaces, and normalizes headers. Duplicated headers are automatically appended with unique suffix indexes (e.g. Temp_1, Temp_2) to uphold Excel specs.
-                  </p>
-                </div>
-
-                <div className="bg-slate-50 border border-slate-200 p-4.5 rounded-xl">
-                  <div className="w-6 h-6 rounded-lg bg-slate-900 text-indigo-400 flex items-center justify-center font-mono text-[10px] font-bold mb-2">C</div>
-                  <strong className="text-slate-900 font-semibold block mb-1">Empty Field Pruning</strong>
-                  <p className="text-[11px] text-slate-500 leading-relaxed">
-                    Scans grid lines and prunes 100% empty rows. Also clears defective columns with blank headers and zero records, shrinking files before Excel compilation.
-                  </p>
-                </div>
-
-                <div className="bg-slate-50 border border-slate-200 p-4.5 rounded-xl">
-                  <div className="w-6 h-6 rounded-lg bg-slate-900 text-emerald-400 flex items-center justify-center font-mono text-[10px] font-bold mb-2">D</div>
-                  <strong className="text-slate-900 font-semibold block mb-1">Data Type Identification</strong>
-                  <p className="text-[11px] text-slate-500 leading-relaxed">
-                    Looks at sample cells and casts values matching numeric constants, float dimensions, or ISO-8601 logs to real numbers or dates, enabling Excel math functions immediately.
-                  </p>
-                </div>
-              </div>
-
-              <div className="p-4 bg-indigo-50 text-indigo-900 border border-indigo-150 rounded-xl font-mono text-[11px] leading-relaxed">
-                <strong>Memory Protection Strategy:</strong> Files mapped in queue discard physical array buffers immediately after statistic collection, only recompiling bytes locally during active downloads. This minimizes standard DOM memory consumption by 90%!
-              </div>
-            </div>
-          </div>
-        )}
-
-        {/* TAB 3: API BLUEPRINT & VERCEL INSPECTION */}
-        {activeTab === 'api-code' && (
-          <div className="flex flex-col gap-8 max-w-6xl mx-auto" id="vercel_guide_container">
-            
-            {/* Introductory Header Banner */}
-            <div className="bg-white border border-slate-200 p-6 rounded-2xl shadow-xs">
-              <h2 className="text-base font-bold text-slate-900 flex items-center gap-2 font-mono">
-                <Terminal className="w-5 h-5 text-indigo-600" />
-                Vercel Serverless Server Architecture & Compatibility Guide
-              </h2>
-              <p className="text-xs text-slate-500 mt-1.5 leading-relaxed">
-                Review server constraints, file limitations, and active configuration settings before deploying multi-file CSV convert routes on Vercel Node engines.
-              </p>
-            </div>
-
-            {/* Interactive Bento Check Grid */}
-            <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-              
-              {/* Compatibility Check Selection Sidebar */}
-              <div className="lg:col-span-4 bg-white border border-slate-200 rounded-2xl p-4 shadow-xs">
-                <h3 className="text-xs font-bold text-slate-400 uppercase tracking-wider font-mono px-2 mb-3">
-                  8 Crucial Vercel Deploy Checks
-                </h3>
-                <div className="space-y-1">
-                  {VERCEL_CHECKS.map((item, index) => (
-                    <button
-                      key={item.id}
-                      onClick={() => setSelectedInspectCheck(item.id)}
-                      className={`w-full text-left p-2.5 rounded-lg text-xs font-medium font-mono transition-all flex items-center justify-between gap-2 cursor-pointer ${
-                        selectedInspectCheck === item.id
-                          ? 'bg-indigo-600 text-white shadow-xs'
-                          : 'text-slate-650 hover:bg-slate-50 hover:text-slate-900'
-                      }`}
-                    >
-                      <span className="truncate flex items-center gap-2">
-                        <span className="opacity-50 text-[10px]">{index + 1}.</span>
-                        {item.title}
-                      </span>
-                      {item.status === 'compatible' && (
-                        <span className={`w-2 h-2 rounded-full flex-shrink-0 ${selectedInspectCheck === item.id ? 'bg-emerald-400' : 'bg-emerald-500'}`} />
-                      )}
-                      {item.status === 'warning' && (
-                        <span className={`w-2 h-2 rounded-full flex-shrink-0 ${selectedInspectCheck === item.id ? 'bg-amber-300' : 'bg-amber-500'}`} />
-                      )}
-                      {item.status === 'restricted' && (
-                        <span className={`w-2 h-2 rounded-full flex-shrink-0 ${selectedInspectCheck === item.id ? 'bg-rose-300' : 'bg-rose-500'}`} />
-                      )}
-                    </button>
-                  ))}
-                </div>
-              </div>
-
-              {/* Inspector Panel Detail View */}
-              <div className="lg:col-span-8 bg-white border border-slate-200 p-6 rounded-2xl shadow-xs flex flex-col justify-between" id="compatibility_details_panel">
-                <div>
-                  <div className="flex items-center justify-between border-b border-slate-100 pb-3 mb-4">
-                    <span className="text-[10px] font-bold font-mono text-indigo-650 uppercase bg-indigo-50 px-2.5 py-1 rounded-md border border-indigo-100">
-                      Vercel Optimization Stage
-                    </span>
-                    <div className="flex items-center gap-2 text-xs font-mono">
-                      <span className="text-slate-400">Security rating:</span>
-                      {activeInspectItem.status === 'compatible' && <span className="text-emerald-600 font-bold">🟢 Fully Validated</span>}
-                      {activeInspectItem.status === 'warning' && <span className="text-amber-600 font-bold">⚠️ Warning Risk</span>}
-                      {activeInspectItem.status === 'restricted' && <span className="text-rose-600 font-bold">🚫 Constraints Alert</span>}
-                    </div>
-                  </div>
-
-                  <h3 className="text-base font-bold text-slate-900 mb-1">
-                    {activeInspectItem.title}
-                  </h3>
-                  <p className="text-[11px] text-slate-400 font-mono italic mb-4">
-                    Target Inquiry: {activeInspectItem.query}
-                  </p>
-
-                  <div className="space-y-4 text-xs text-slate-650 leading-relaxed">
-                    <div className="bg-slate-50 border border-slate-200 p-4 rounded-xl">
-                      <strong className="text-slate-800 font-semibold block mb-1">Architectural Details:</strong>
-                      {activeInspectItem.details}
-                    </div>
-
-                    <div className="bg-indigo-50/50 border border-indigo-100 p-4 rounded-xl text-slate-800 leading-relaxed">
-                      <strong className="text-indigo-950 font-semibold block flex items-center gap-1.5 mb-1 text-indigo-800">
-                        <CheckCircle2 className="w-4 h-4 text-emerald-500" />
-                        Resolution Implementation:
-                      </strong>
-                      <span className="font-mono text-[11px] text-indigo-900">{activeInspectItem.solution}</span>
-                    </div>
-                  </div>
-                </div>
-
-                <div className="border-t border-slate-150 pt-4 mt-6 flex items-center justify-between text-[11px] text-slate-400 font-mono">
-                  <span>Isolated stateless computation</span>
-                  <span className="flex items-center gap-1">
-                    <ShieldCheck className="w-4 h-4 text-emerald-500" /> Secure Sandbox Verified
-                  </span>
-                </div>
-              </div>
-
-            </div>
-
-            {/* Production-Ready Next.js Route Endpoint Code */}
-            <div className="bg-white border border-slate-200 p-6 sm:p-8 shadow-xs rounded-3xl" id="api_code_details">
-              <div className="border-b border-slate-100 pb-5 mb-5">
-                <h2 className="text-lg font-bold text-slate-900 flex items-center gap-2">
-                  <Terminal className="w-5 h-5 text-indigo-600" />
-                  Next.js App Router API Endpoint: `/api/convert/route.ts`
-                </h2>
-                <p className="text-xs text-slate-500 mt-1 leading-relaxed">
-                  Complete production code implementing the requested configuration: Node.js runtime, proper error boundaries, and 100% safe in-memory buffer compilation.
-                </p>
-              </div>
-
-              <div className="relative">
-                <div className="absolute right-4 top-4 bg-slate-100 border border-slate-200 text-slate-600 px-2.5 py-1 text-[10px] rounded font-mono font-bold select-none">
-                  TypeScript / ESM / App Router
-                </div>
-                
-                <pre className="p-5 bg-slate-900 text-slate-300 rounded-xl font-mono text-[11px] overflow-x-auto leading-relaxed max-h-[520px] shadow-sm whitespace-pre">
-{`import { NextRequest, NextResponse } from 'next/server';
-import * as XLSX from 'xlsx';
-
-// -------------------------------------------------------------
-// VERCEL CONFIGURATION FOR OPTIMAL RUNTIME RUNS (Quest 4, 5, 6)
-// -------------------------------------------------------------
-// Use full Node.js serverless container (Avoid Edge runtime restrictions)
-export const runtime = 'nodejs'; 
-// Extend execution time budget to max 60s (Pro/Enterprise) to avoid early timeout
-export const maxDuration = 60; 
-
-/**
- * Autodetects delimiters responsibly to reduce parser configuration steps.
- */
-function detectSeparator(text: string): string {
-  const potentialSeparators = [';', ',', '\\t', '|'];
-  const lines = text.split(/\\r?\\n/).filter(l => l.trim().length > 0).slice(0, 15);
-  if (lines.length === 0) return ',';
-  
-  let bestSep = ',';
-  let maxScore = -1;
-  
-  for (const sep of potentialSeparators) {
-    let score = 0;
-    lines.forEach(line => {
-      score += (line.split(sep).length - 1);
-    });
-    if (score > maxScore) {
-      maxScore = score;
-      bestSep = sep;
-    }
-  }
-  return bestSep;
-}
-
-/**
- * HTTP POST route executing 100% in-memory data conversions safely (Quest 2, 7 & 8)
- */
-export async function POST(req: NextRequest) {
-  try {
-    const formData = await req.formData();
-    const file = formData.get('file') as File | null;
-    
-    // Safety check 8: Return graceful explanatory error codes to the client
-    if (!file) {
-      return NextResponse.json(
-        { error: 'Invalid attachment. No raw CSV file provided.' }, 
-        { status: 400 }
-      );
-    }
-
-    if (file.size > 4.5 * 1024 * 1024) {
-      return NextResponse.json({
-        error: 'File size limits exceeded.',
-        detail: \`The uploaded file is \${(file.size / (1024 * 1024)).toFixed(1)}MB. Vercel Serverless bodies are capped at 4.5MB. Perform conversion locally inside browser memory structures.\`
-      }, { status: 413 });
-    }
-
-    // Safety check 7: Handle data in transient container memory matrices 
-    const text = await file.text();
-    const separator = detectSeparator(text);
-    
-    // Parse Rows
-    const rawRows = text.split(/\\r?\\n/).map(line => {
-      return line.split(separator).map(cell => cell.trim().replace(/^"|"$/g, ''));
-    });
-    
-    // Build spreadsheet components using SheetJS
-    const ws = XLSX.utils.aoa_to_sheet(rawRows);
-    const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, ws, 'Clean_Export');
-    
-    // Write directly to an array buffer statelessly (No local server files created!)
-    const xlsxBuffer = XLSX.write(wb, { bookType: 'xlsx', type: 'buffer' });
-
-    // Output spreadsheet binary download cleanly
-    return new NextResponse(xlsxBuffer, {
-      headers: {
-        'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-        'Content-Disposition': \`attachment; filename="\${file.name.replace(/\\.csv$/i, '')}.xlsx"\`
-      }
-    });
-
-  } catch (err: any) {
-    console.error('Stateless compile crash:', err);
-    return NextResponse.json({ 
-      error: 'In-memory Excel conversion exception', 
-      details: err?.message || 'Malformed headers structure.' 
-    }, { status: 500 });
-  }
-}`}
-                </pre>
-              </div>
-            </div>
-
-          </div>
-        )}
+        </div>
 
       </main>
 
