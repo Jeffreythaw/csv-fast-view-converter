@@ -60,3 +60,28 @@ Vercel builds the Vite frontend only:
 - Output directory: `dist`
 
 Set `VITE_API_BASE=https://your-backend.example.com` in Vercel. Deploy `backend/` separately on a long-running service.
+
+## Download Troubleshooting
+
+The frontend downloads completed output with:
+
+```text
+${VITE_API_BASE}/api/jobs/${jobId}/download
+```
+
+For the Render backend, `VITE_API_BASE` should be:
+
+```text
+https://csv-fast-view-converter.onrender.com
+```
+
+If Download shows `Not Found`, check `GET /api/jobs/{job_id}` first. The response includes:
+
+- `status`
+- `filename`
+- `output_ready`
+- `output_exists`
+- `output_size`
+- `error`
+
+The backend only marks a job `completed` after the ZIP file exists and has a non-zero file size. The frontend also displays the backend URL, job ID, download URL, output readiness, and the HTTP status/error text if download fails.

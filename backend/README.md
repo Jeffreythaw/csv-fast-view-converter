@@ -26,3 +26,14 @@ pip install -r requirements-parquet.txt
 - `DELETE /api/jobs/{job_id}` cleanup now
 
 Temporary uploads and outputs are kept under `backend/tmp` and cleaned after the configured TTL.
+
+## Download Checks
+
+`GET /api/jobs/{job_id}` returns output debug fields:
+
+- `output_ready`
+- `output_exists`
+- `output_size`
+- `error`
+
+`GET /api/jobs/{job_id}/download` returns a ZIP `FileResponse` only when the job is completed and the output ZIP exists with a size greater than zero. Otherwise it returns a JSON error with the job ID, status, and output file state. Backend logs include the job ID, output ZIP path, file existence, file size, and requested download URL.

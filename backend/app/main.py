@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+import os
 import shutil
 import time
 import uuid
@@ -20,6 +22,7 @@ UPLOAD_DIR = TMP_DIR / "uploads"
 OUTPUT_DIR = TMP_DIR / "outputs"
 JOB_TTL_SECONDS = 24 * 60 * 60
 CHUNK_SIZE = 1024 * 1024
+logger = logging.getLogger("csv_fast_view_converter")
 
 Status = Literal["queued", "uploading", "processing", "completed", "failed"]
 
@@ -52,6 +55,7 @@ app.add_middleware(
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["Content-Disposition"],
 )
 
 
@@ -65,6 +69,13 @@ def touch(job: Job) -> None:
 
 def public_job(job: Job) -> dict:
     payload = asdict(job)
+    output_path = Path(job.output_path) if job.output_path else None
+    output_exists = bool(output_path and output_path.exists())
+    output_size = output_path.stat().st_size if output_exists else 0
+    output_readable = bool(output_exists and output_path and os.access(output_path, os.R_OK))
+    payload["output_ready"] = job.status == "completed" and output_exists and output_size > 0 and output_readable
+    payload["output_exists"] = output_exists
+    payload["output_size"] = output_size
     payload.pop("upload_path", None)
     payload.pop("output_path", None)
     payload.pop("cleanup_paths", None)
@@ -76,6 +87,7 @@ def cleanup_expired_jobs() -> None:
     expired = [job_id for job_id, job in jobs.items() if job.updated_at < cutoff]
     for job_id in expired:
         job = jobs.pop(job_id)
+        logger.info("Cleaning expired job_id=%s status=%s output_path=%s", job_id, job.status, job.output_path)
         for raw_path in job.cleanup_paths:
             path = Path(raw_path)
             if path.is_dir():
@@ -97,11 +109,22 @@ def run_processing(job_id: str) -> None:
 
     try:
         output_dir = OUTPUT_DIR / job_id
-        archive = process_csv(Path(job.upload_path or ""), output_dir, job.output_format, progress)
+        archive = process_csv(Path(job.upload_path or ""), output_dir, job.output_format, progress).resolve()
+        archive_exists = archive.exists()
+        archive_size = archive.stat().st_size if archive_exists else 0
+        logger.info(
+            "Processing finished job_id=%s output_zip_path=%s output_exists=%s output_size=%s",
+            job_id,
+            archive,
+            archive_exists,
+            archive_size,
+        )
+        if not archive_exists or archive_size <= 0:
+            raise RuntimeError(f"Output ZIP was not created correctly: {archive}")
         job.status = "completed"
         job.output_path = str(archive)
         job.download_url = f"/api/jobs/{job.id}/download"
-        job.message = "Conversion completed."
+        job.message = "Conversion completed. Output ZIP is ready to download."
         job.cleanup_paths.append(str(output_dir))
     except Exception as exc:
         job.status = "failed"
@@ -175,14 +198,46 @@ def get_job(job_id: str) -> dict:
 
 @app.get("/api/jobs/{job_id}/download")
 def download_job(job_id: str) -> FileResponse:
+    logger.info("Download requested job_id=%s url=/api/jobs/%s/download", job_id, job_id)
     job = jobs.get(job_id)
     if job is None:
-        raise HTTPException(status_code=404, detail="Job not found or expired.")
+        logger.warning("Download failed job_id=%s reason=job_not_found", job_id)
+        raise HTTPException(status_code=404, detail={"message": "Job not found or expired.", "job_id": job_id})
     if job.status != "completed" or not job.output_path:
-        raise HTTPException(status_code=409, detail="Job is not completed.")
+        logger.warning("Download failed job_id=%s status=%s output_path=%s", job_id, job.status, job.output_path)
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "Job is not completed or output is not ready.",
+                "job_id": job_id,
+                "status": job.status,
+                "output_ready": False,
+            },
+        )
     output_path = Path(job.output_path)
-    if not output_path.exists():
-        raise HTTPException(status_code=404, detail="Output file has expired.")
+    output_exists = output_path.exists()
+    output_size = output_path.stat().st_size if output_exists else 0
+    output_readable = output_exists and os.access(output_path, os.R_OK)
+    logger.info(
+        "Download check job_id=%s output_zip_path=%s output_exists=%s output_size=%s output_readable=%s",
+        job_id,
+        output_path,
+        output_exists,
+        output_size,
+        output_readable,
+    )
+    if not output_exists or output_size <= 0 or not output_readable:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "message": "Output ZIP is missing, empty, or not readable. It may have expired or the backend instance restarted.",
+                "job_id": job_id,
+                "status": job.status,
+                "output_exists": output_exists,
+                "output_size": output_size,
+                "output_readable": output_readable,
+            },
+        )
     return FileResponse(output_path, filename=output_path.name, media_type="application/zip")
 
 

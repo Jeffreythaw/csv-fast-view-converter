@@ -24,6 +24,10 @@ interface QueueFile {
   message?: string;
   error?: string;
   downloadUrl?: string;
+  downloadStatus?: string;
+  outputReady?: boolean;
+  outputExists?: boolean;
+  outputSize?: number;
 }
 
 interface BackendJob {
@@ -36,6 +40,9 @@ interface BackendJob {
   message: string;
   error?: string;
   download_url?: string;
+  output_ready: boolean;
+  output_exists: boolean;
+  output_size: number;
 }
 
 const API_BASE = (import.meta.env.VITE_API_BASE || 'http://localhost:8000').replace(/\/$/, '');
@@ -98,6 +105,30 @@ function uploadFile(file: File, outputFormat: OutputFormat, onProgress: (progres
   });
 }
 
+async function readError(response: Response): Promise<string> {
+  const text = await response.text();
+  if (!text) return `HTTP ${response.status} ${response.statusText}`;
+  try {
+    const parsed = JSON.parse(text) as { detail?: unknown; message?: string };
+    if (typeof parsed.detail === 'string') return parsed.detail;
+    if (parsed.detail && typeof parsed.detail === 'object') {
+      const detail = parsed.detail as { message?: string };
+      return detail.message ? `${detail.message} (${JSON.stringify(parsed.detail)})` : JSON.stringify(parsed.detail);
+    }
+    return parsed.message || text;
+  } catch {
+    return text;
+  }
+}
+
+function filenameFromDisposition(disposition: string | null, fallback: string) {
+  if (!disposition) return fallback;
+  const utfMatch = disposition.match(/filename\*=UTF-8''([^;]+)/i);
+  if (utfMatch?.[1]) return decodeURIComponent(utfMatch[1]);
+  const match = disposition.match(/filename="?([^";]+)"?/i);
+  return match?.[1] || fallback;
+}
+
 export default function App() {
   const inputRef = useRef<HTMLInputElement>(null);
   const [files, setFiles] = useState<QueueFile[]>([]);
@@ -137,6 +168,50 @@ export default function App() {
     setProgressMessage('Select large BMS / ACMV CSV files, then upload to the processing backend.');
   };
 
+  const downloadOutput = async (item: QueueFile) => {
+    if (!item.jobId) {
+      updateFile(item.id, { error: 'Missing job ID for download.' });
+      return;
+    }
+    const downloadUrl = `${API_BASE}/api/jobs/${item.jobId}/download`;
+    updateFile(item.id, { downloadStatus: `Downloading from ${downloadUrl}`, error: undefined });
+    try {
+      const response = await fetch(downloadUrl);
+      if (!response.ok) {
+        const detail = await readError(response);
+        const message = `Download failed with HTTP ${response.status}: ${detail}`;
+        updateFile(item.id, { error: message, downloadStatus: message });
+        setErrorMessage(message);
+        return;
+      }
+
+      const blob = await response.blob();
+      if (blob.size === 0) {
+        const message = 'Download failed: backend returned an empty ZIP file.';
+        updateFile(item.id, { error: message, downloadStatus: message });
+        setErrorMessage(message);
+        return;
+      }
+
+      const fallbackName = `${item.file.name.replace(/\.csv$/i, '')}-${outputFormat}.zip`;
+      const filename = filenameFromDisposition(response.headers.get('Content-Disposition'), fallbackName);
+      const objectUrl = URL.createObjectURL(blob);
+      const anchor = document.createElement('a');
+      anchor.href = objectUrl;
+      anchor.download = filename;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      window.setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
+      updateFile(item.id, { downloadStatus: `Downloaded ${filename} (${formatBytes(blob.size)}).` });
+      setErrorMessage(null);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unexpected download error.';
+      updateFile(item.id, { error: message, downloadStatus: message });
+      setErrorMessage(message);
+    }
+  };
+
   const runJobs = async () => {
     if (files.length === 0 || isRunning) return;
     setIsRunning(true);
@@ -152,6 +227,10 @@ export default function App() {
           status: created.status,
           message: created.message,
           rowsProcessed: created.rows_processed,
+          outputReady: created.output_ready,
+          outputExists: created.output_exists,
+          outputSize: created.output_size,
+          downloadUrl: `${API_BASE}/api/jobs/${created.id}/download`,
           uploadProgress: 100,
         });
 
@@ -162,14 +241,26 @@ export default function App() {
             message: job.message,
             rowsProcessed: job.rows_processed,
             error: job.error,
-            downloadUrl: job.download_url ? `${API_BASE}${job.download_url}` : undefined,
+            outputReady: job.output_ready,
+            outputExists: job.output_exists,
+            outputSize: job.output_size,
+            downloadUrl: `${API_BASE}/api/jobs/${job.id}/download`,
           });
         });
 
         if (finalJob.status === 'failed') {
           throw new Error(finalJob.error || 'Backend conversion failed.');
         }
-        setProgressMessage(`${item.file.name} completed.`);
+        if (!finalJob.output_ready) {
+          throw new Error(`Backend marked the job completed, but the output ZIP is not ready. exists=${finalJob.output_exists}, size=${finalJob.output_size}`);
+        }
+        updateFile(item.id, {
+          outputReady: finalJob.output_ready,
+          outputExists: finalJob.output_exists,
+          outputSize: finalJob.output_size,
+          downloadUrl: `${API_BASE}/api/jobs/${finalJob.id}/download`,
+        });
+        setProgressMessage(`${item.file.name} completed and is ready to download.`);
       } catch (error) {
         const message = error instanceof Error ? error.message : 'Unexpected conversion error.';
         updateFile(item.id, { status: 'failed', error: message, message });
@@ -277,6 +368,17 @@ export default function App() {
                             {item.rowsProcessed ? ` ${item.rowsProcessed.toLocaleString()} rows processed.` : ''}
                           </p>
                           {item.error && <p className="mt-1 text-xs text-rose-600">{item.error}</p>}
+                          {item.jobId && (
+                            <div className="mt-2 space-y-1 rounded-lg bg-white p-2 text-[11px] leading-4 text-slate-500">
+                              <p className="break-all"><span className="font-semibold text-slate-700">Job ID:</span> {item.jobId}</p>
+                              <p className="break-all"><span className="font-semibold text-slate-700">Download URL:</span> {item.downloadUrl || `${API_BASE}/api/jobs/${item.jobId}/download`}</p>
+                              <p>
+                                <span className="font-semibold text-slate-700">Output:</span>{' '}
+                                ready={String(Boolean(item.outputReady))}, exists={String(Boolean(item.outputExists))}, size={formatBytes(item.outputSize || 0)}
+                              </p>
+                              {item.downloadStatus && <p className="break-all"><span className="font-semibold text-slate-700">Download status:</span> {item.downloadStatus}</p>}
+                            </div>
+                          )}
                         </div>
                         <span className={`w-fit rounded-full px-2.5 py-1 text-xs font-semibold ${statusTone(item.status)}`}>
                           {item.status}
@@ -287,14 +389,16 @@ export default function App() {
                           <div className="h-full bg-blue-600 transition-all" style={{ width: `${item.uploadProgress}%` }} />
                         </div>
                       )}
-                      {item.downloadUrl && (
-                        <a
-                          href={item.downloadUrl}
-                          className="mt-3 inline-flex items-center gap-2 rounded-lg bg-emerald-600 px-3 py-2 text-xs font-semibold text-white hover:bg-emerald-700"
+                      {item.jobId && item.status === 'completed' && (
+                        <button
+                          type="button"
+                          onClick={() => void downloadOutput(item)}
+                          disabled={!item.outputReady}
+                          className="mt-3 inline-flex items-center gap-2 rounded-lg bg-emerald-600 px-3 py-2 text-xs font-semibold text-white hover:bg-emerald-700 disabled:cursor-not-allowed disabled:opacity-40"
                         >
                           <Download className="h-4 w-4" />
                           Download Output ZIP
-                        </a>
+                        </button>
                       )}
                     </div>
                   ))}
