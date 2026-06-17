@@ -13,8 +13,10 @@ def main() -> int:
     parser.add_argument("--format", choices=["xlsx", "sqlite", "parquet"], default="xlsx")
     args = parser.parse_args()
 
-    def progress(rows: int) -> None:
-        if rows % 100000 == 0:
+    def progress(rows: int, message: str | None = None) -> None:
+        if message:
+            print(message)
+        elif rows % 100000 == 0:
             print(f"processed {rows:,} rows")
 
     archive = process_csv(Path(args.csv_path), Path(args.out), args.format, progress)

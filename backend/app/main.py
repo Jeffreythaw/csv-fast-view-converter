@@ -102,9 +102,9 @@ def run_processing(job_id: str) -> None:
     job.message = "Processing CSV stream."
     touch(job)
 
-    def progress(rows: int) -> None:
+    def progress(rows: int, message: str | None = None) -> None:
         job.rows_processed = rows
-        job.message = f"Processed {rows:,} rows."
+        job.message = message or f"Processed {rows:,} rows."
         touch(job)
 
     try:

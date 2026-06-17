@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import csv
 import math
+import re
 import sqlite3
 import zipfile
 from collections import Counter
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
 
@@ -13,6 +15,10 @@ EXCEL_MAX_ROWS = 1_048_576
 EXCEL_DATA_ROWS_PER_SHEET = EXCEL_MAX_ROWS - 1
 MAX_COLUMNS = 300
 STATUS_LIMIT = 50
+CHART_ROW_THRESHOLD = 100_000
+MAX_CHART_POINTS = 1500
+SHORT_CYCLE_MINUTES = 10
+COMMAND_RESPONSE_DELAY_MINUTES = 5
 
 OutputFormat = Literal["xlsx", "sqlite", "parquet"]
 
@@ -83,9 +89,195 @@ class ProcessResult:
     report: str
 
 
+@dataclass
+class ColumnMeta:
+    name: str
+    index: int
+    equipment: str
+    metric: str
+    is_discrete: bool
+    is_alarm: bool
+    is_analog: bool
+
+
+@dataclass
+class StatePeriod:
+    equipment: str
+    column: str
+    start_time: datetime | None
+    end_time: datetime | None
+    start_row: int
+    end_row: int
+    state: int
+
+
+@dataclass
+class EventRecord:
+    timestamp: datetime | None
+    equipment: str
+    issue_type: str
+    evidence: str
+    severity: str
+    comment: str
+
+
+@dataclass
+class AnalogRecord:
+    column: str
+    equipment: str
+    metric: str
+    count: int = 0
+    nonzero_count: int = 0
+    zero_count: int = 0
+    mean: float = 0.0
+    m2: float = 0.0
+    minimum: float | None = None
+    maximum: float | None = None
+    latest: float | None = None
+    max_time: datetime | None = None
+
+    def add(self, value: float, timestamp: datetime | None) -> None:
+        self.count += 1
+        self.latest = value
+        if abs(value) <= analog_near_zero_threshold(self.metric):
+            self.zero_count += 1
+        else:
+            self.nonzero_count += 1
+        delta = value - self.mean
+        self.mean += delta / self.count
+        self.m2 += delta * (value - self.mean)
+        if self.minimum is None or value < self.minimum:
+            self.minimum = value
+        if self.maximum is None or value > self.maximum:
+            self.maximum = value
+            self.max_time = timestamp
+
+    @property
+    def std_dev(self) -> float:
+        return math.sqrt(self.m2 / self.count) if self.count > 1 else 0.0
+
+
+@dataclass
+class EquipmentState:
+    equipment: str
+    columns: list[str]
+    command_columns: list[int]
+    status_columns: list[int]
+    alarm_columns: list[int]
+    analog_columns: list[int]
+    vsd_columns: list[int]
+    runtime_columns: list[int]
+    periods: list[StatePeriod]
+    starts: int = 0
+    stops: int = 0
+    short_cycles: int = 0
+
+
+@dataclass
+class ChartBucket:
+    start: datetime | None
+    row_start: int
+    row_end: int
+    values: dict[str, list[float]]
+    states: dict[str, list[int]]
+
+
+@dataclass
+class TrendAnalysis:
+    headers: list[str]
+    metas: list[ColumnMeta]
+    datetime_index: int | None
+    rows_read: int = 0
+    first_timestamp: datetime | None = None
+    last_timestamp: datetime | None = None
+    previous_timestamp: datetime | None = None
+    interval_seconds: Counter[int] = None  # type: ignore[assignment]
+    duplicate_timestamps: int = 0
+    data_gaps: int = 0
+    equipment: dict[str, EquipmentState] = None  # type: ignore[assignment]
+    analogs: dict[int, AnalogRecord] = None  # type: ignore[assignment]
+    events: list[EventRecord] = None  # type: ignore[assignment]
+    active_periods: dict[int, StatePeriod] = None  # type: ignore[assignment]
+    previous_states: dict[int, int] = None  # type: ignore[assignment]
+    mismatch_streaks: dict[str, int] = None  # type: ignore[assignment]
+    chart_columns: list[int] = None  # type: ignore[assignment]
+    chart_status_columns: list[int] = None  # type: ignore[assignment]
+    chart_buckets: list[ChartBucket] = None  # type: ignore[assignment]
+    bucket_size_rows: int = 1
+
+    def __post_init__(self) -> None:
+        self.interval_seconds = Counter()
+        self.equipment = {}
+        self.analogs = {}
+        self.events = []
+        self.active_periods = {}
+        self.previous_states = {}
+        self.mismatch_streaks = {}
+        self.chart_columns = select_chart_columns(self.metas)
+        self.chart_status_columns = select_chart_status_columns(self.metas)
+        self.chart_buckets = []
+        for meta in self.metas:
+            state = self.equipment.setdefault(
+                meta.equipment,
+                EquipmentState(meta.equipment, [], [], [], [], [], [], [], []),
+            )
+            state.columns.append(meta.name)
+            if meta.metric == "command":
+                state.command_columns.append(meta.index)
+            if meta.metric in {"run_status", "status", "valve_open_status", "valve_close_status"}:
+                state.status_columns.append(meta.index)
+            if meta.is_alarm:
+                state.alarm_columns.append(meta.index)
+            if meta.is_analog:
+                state.analog_columns.append(meta.index)
+                self.analogs[meta.index] = AnalogRecord(meta.name, meta.equipment, meta.metric)
+            if meta.metric == "vsd_feedback":
+                state.vsd_columns.append(meta.index)
+            if meta.metric == "runtime":
+                state.runtime_columns.append(meta.index)
+
 def normalize_name(value: Any) -> str:
     text = str(value or "").lower().replace("_", " ").replace("-", " ")
     return f" {' '.join(text.split())} "
+
+
+def compact_name(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).strip()
+
+
+def parse_timestamp(value: Any) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    formats = [
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%d/%m/%Y %H:%M:%S",
+        "%d/%m/%Y %H:%M",
+        "%d-%m-%Y %H:%M:%S",
+        "%d-%m-%Y %H:%M",
+        "%d %b %Y %H:%M:%S",
+        "%d %b %Y %H:%M",
+        "%m/%d/%Y %H:%M:%S",
+        "%m/%d/%Y %H:%M",
+    ]
+    for fmt in formats:
+        try:
+            return datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).replace(tzinfo=None)
+    except ValueError:
+        return None
+
+
+def detect_datetime_index(headers: list[str]) -> int | None:
+    for index, header in enumerate(headers):
+        normalized = normalize_name(header)
+        if any(token in normalized for token in [" date ", " time ", " timestamp ", " datetime "]):
+            return index
+    return 0 if headers else None
 
 
 def classify_column(header: str) -> str:
@@ -96,6 +288,171 @@ def classify_column(header: str) -> str:
         if any(keyword in normalized for keyword in keywords):
             return category
     return "unknown"
+
+
+def parse_equipment_and_metric(header: str) -> tuple[str, str]:
+    text = compact_name(header)
+    normalized = f" {text} "
+    number_match = re.search(r"\b(?:no|unit|cell)?\s*([0-9]+(?:[-_][0-9]+)?)\b", text)
+    suffix = f" {number_match.group(1).replace('_', '-')}" if number_match else ""
+
+    if any(token in normalized for token in [" chilled water pump ", " chw pump ", " chwp "]):
+        equipment = f"CHWP{suffix}".strip()
+    elif any(token in normalized for token in [" condenser water pump ", " cdw pump ", " cwp ", " cdwp "]):
+        equipment = f"CDWP{suffix}".strip()
+    elif any(token in normalized for token in [" cooling tower ", " ct fan ", " ct cell ", " tower cell "]):
+        equipment = f"Cooling Tower{suffix}".strip()
+    elif " chiller " in normalized or re.search(r"\bch(?:iller)?\s*[0-9]\b", text):
+        equipment = f"Chiller{suffix}".strip()
+    elif " ahu " in normalized or " air handling unit " in normalized:
+        equipment = f"AHU{suffix}".strip()
+    elif " fcu " in normalized or " fan coil " in normalized:
+        equipment = f"FCU{suffix}".strip()
+    elif " mcc " in normalized or " power meter " in normalized or " incoming " in normalized:
+        equipment = f"MCC / Power Meter{suffix}".strip()
+    elif " valve " in normalized or " vlv " in normalized:
+        equipment = f"Valve{suffix}".strip()
+    elif " fan " in normalized or " blower " in normalized:
+        equipment = f"Fan{suffix}".strip()
+    elif " pump " in normalized:
+        equipment = f"Pump{suffix}".strip()
+    else:
+        equipment = "Unknown Equipment"
+
+    if any(token in normalized for token in [" lockout ", " locked out "]):
+        metric = "lockout"
+    elif any(token in normalized for token in [" trip ", " tripped "]):
+        metric = "trip"
+    elif any(token in normalized for token in [" fail ", " failure ", " fault "]):
+        metric = "fail"
+    elif any(token in normalized for token in [" alarm ", " warning ", " low level ", " high level "]):
+        metric = "alarm"
+    elif any(token in normalized for token in [" available ", " availability "]):
+        metric = "available"
+    elif any(token in normalized for token in [" maintenance ", " maint "]) or " hand " in normalized:
+        metric = "maintenance_mode"
+    elif " auto " in normalized or " manual " in normalized or " switch " in normalized:
+        metric = "switch_mode"
+    elif any(token in normalized for token in [" command ", " cmd ", " enable ", " start cmd ", " stop cmd "]):
+        metric = "command"
+    elif (" vsd " in normalized or " vfd " in normalized) and any(token in normalized for token in [" feedback ", " fb ", " speed ", " hz ", " frequency "]):
+        metric = "vsd_feedback"
+    elif (" vsd " in normalized or " vfd " in normalized) and any(token in normalized for token in [" command ", " cmd ", " reference "]):
+        metric = "vsd_command"
+    elif " runtime " in normalized or " run hour " in normalized:
+        metric = "runtime"
+    elif (" open " in normalized or " opened " in normalized) and (" valve " in normalized or " status " in normalized):
+        metric = "valve_open_status"
+    elif (" close " in normalized or " closed " in normalized) and (" valve " in normalized or " status " in normalized):
+        metric = "valve_close_status"
+    elif any(token in normalized for token in [" run status ", " running ", " status ", " proof ", " feedback ", " on off "]):
+        metric = "run_status"
+    elif any(token in normalized for token in [" active power ", " power ", " kw ", " kilowatt "]):
+        metric = "active_power"
+    elif any(token in normalized for token in [" active energy ", " energy ", " kwh "]):
+        metric = "active_energy"
+    elif any(token in normalized for token in [" current ", " amp ", " amps "]):
+        metric = "current"
+    elif any(token in normalized for token in [" voltage ", " volt ", " vln ", " vll "]):
+        metric = "voltage"
+    elif any(token in normalized for token in [" frequency ", " hz "]):
+        metric = "frequency"
+    elif any(token in normalized for token in [" temperature ", " temp ", " chwst ", " chwrt ", " chws ", " chwr ", " lwt ", " ewt "]):
+        metric = "temperature"
+    elif any(token in normalized for token in [" pressure ", " press ", " differential pressure ", " delta p ", " dp "]):
+        metric = "pressure"
+    elif any(token in normalized for token in [" flow ", " airflow ", " air flow ", " water flow "]):
+        metric = "flow"
+    elif any(token in normalized for token in [" humidity ", " rh "]):
+        metric = "humidity"
+    elif " setpoint " in normalized or " set point " in normalized or " sp " in normalized:
+        metric = "setpoint"
+    else:
+        metric = "unknown"
+    return equipment, metric
+
+
+def is_discrete_metric(metric: str) -> bool:
+    return metric in {
+        "command",
+        "run_status",
+        "status",
+        "trip",
+        "alarm",
+        "fail",
+        "lockout",
+        "available",
+        "maintenance_mode",
+        "switch_mode",
+        "valve_open_status",
+        "valve_close_status",
+    }
+
+
+def is_alarm_metric(metric: str) -> bool:
+    return metric in {"trip", "alarm", "fail", "lockout"}
+
+
+def is_meaningful_analog(metric: str) -> bool:
+    return metric in {"active_power", "current", "vsd_feedback", "temperature", "pressure", "flow", "humidity"}
+
+
+def analog_near_zero_threshold(metric: str) -> float:
+    if metric in {"active_power", "current", "vsd_feedback", "flow"}:
+        return 0.1
+    return 0.01
+
+
+def classify_columns(headers: list[str]) -> list[ColumnMeta]:
+    metas: list[ColumnMeta] = []
+    for index, header in enumerate(headers):
+        equipment, metric = parse_equipment_and_metric(header)
+        metas.append(
+            ColumnMeta(
+                name=header,
+                index=index,
+                equipment=equipment,
+                metric=metric,
+                is_discrete=is_discrete_metric(metric),
+                is_alarm=is_alarm_metric(metric),
+                is_analog=is_meaningful_analog(metric),
+            )
+        )
+    return metas
+
+
+def parse_state(value: Any) -> int | None:
+    text = str(value or "").strip().lower()
+    if not text:
+        return None
+    if text in TRUE_VALUES or text in ACTIVE_STATUS_VALUES:
+        return 1
+    if text in FALSE_VALUES or text in {"inactive", "ok", "healthy", "ready", "not alarm"}:
+        return 0
+    number = parse_number(text)
+    if number is None:
+        return None
+    return 1 if abs(number) > 0.1 else 0
+
+
+def format_dt(value: datetime | None) -> str:
+    return value.strftime("%d %b %Y %H:%M") if value else "Unknown"
+
+
+def format_duration(minutes: float) -> str:
+    if minutes <= 0:
+        return "0 min"
+    days = int(minutes // 1440)
+    hours = int((minutes % 1440) // 60)
+    mins = int(minutes % 60)
+    parts: list[str] = []
+    if days:
+        parts.append(f"{days} days")
+    if hours:
+        parts.append(f"{hours} hours")
+    if mins or not parts:
+        parts.append(f"{mins} min")
+    return " ".join(parts)
 
 
 def clean_header(value: Any, index: int) -> str:
@@ -192,6 +549,279 @@ def fit_row(raw_row: list[str], column_count: int) -> list[str]:
     return row
 
 
+def select_chart_columns(metas: list[ColumnMeta]) -> list[int]:
+    priority = {"active_power": 0, "current": 1, "vsd_feedback": 2, "temperature": 3, "pressure": 4, "flow": 5}
+    candidates = [meta for meta in metas if meta.is_analog and meta.metric in priority]
+    candidates.sort(key=lambda meta: (priority.get(meta.metric, 99), meta.equipment, meta.name))
+    selected: list[int] = []
+    seen_equipment_metric: set[tuple[str, str]] = set()
+    for meta in candidates:
+        key = (meta.equipment, meta.metric)
+        if key in seen_equipment_metric:
+            continue
+        seen_equipment_metric.add(key)
+        selected.append(meta.index)
+        if len(selected) >= 8:
+            break
+    return selected
+
+
+def select_chart_status_columns(metas: list[ColumnMeta]) -> list[int]:
+    candidates = [meta for meta in metas if meta.metric in {"run_status", "valve_open_status"}]
+    selected: list[int] = []
+    seen_equipment: set[str] = set()
+    for meta in candidates:
+        if meta.equipment in seen_equipment:
+            continue
+        seen_equipment.add(meta.equipment)
+        selected.append(meta.index)
+        if len(selected) >= 10:
+            break
+    return selected
+
+
+def build_analyzer(headers: list[str]) -> TrendAnalysis:
+    metas = classify_columns(headers)
+    return TrendAnalysis(headers=headers, metas=metas, datetime_index=detect_datetime_index(headers))
+
+
+def estimate_bucket_size(rows_read: int) -> int:
+    if rows_read <= CHART_ROW_THRESHOLD:
+        return 1
+    return max(1, math.ceil(rows_read / MAX_CHART_POINTS))
+
+
+def update_chart_bucket(analysis: TrendAnalysis, row: list[str], timestamp: datetime | None) -> None:
+    bucket_index = (analysis.rows_read - 1) // max(analysis.bucket_size_rows, 1)
+    if len(analysis.chart_buckets) <= bucket_index:
+        analysis.chart_buckets.append(ChartBucket(timestamp, analysis.rows_read, analysis.rows_read, {}, {}))
+    bucket = analysis.chart_buckets[bucket_index]
+    bucket.row_end = analysis.rows_read
+    if bucket.start is None:
+        bucket.start = timestamp
+    for index in analysis.chart_columns:
+        if index >= len(row):
+            continue
+        number = parse_number(row[index])
+        if number is not None:
+            bucket.values.setdefault(analysis.headers[index], []).append(number)
+    for index in analysis.chart_status_columns:
+        if index >= len(row):
+            continue
+        state = parse_state(row[index])
+        if state is not None:
+            bucket.states.setdefault(analysis.headers[index], []).append(state)
+
+
+def delay_rows(analysis: TrendAnalysis) -> int:
+    if analysis.interval_seconds:
+        interval = max(analysis.interval_seconds.most_common(1)[0][0], 1)
+        return max(1, math.ceil((COMMAND_RESPONSE_DELAY_MINUTES * 60) / interval))
+    return COMMAND_RESPONSE_DELAY_MINUTES
+
+
+def set_mismatch(analysis: TrendAnalysis, key: str, active: bool, event_factory: Any) -> None:
+    if not active:
+        analysis.mismatch_streaks.pop(key, None)
+        return
+    streak = analysis.mismatch_streaks.get(key, 0) + 1
+    analysis.mismatch_streaks[key] = streak
+    if streak == delay_rows(analysis):
+        analysis.events.append(event_factory())
+
+
+def evaluate_equipment_rules(analysis: TrendAnalysis, row: list[str], timestamp: datetime | None) -> None:
+    for state in analysis.equipment.values():
+        command_states = [parse_state(row[index]) for index in state.command_columns if index < len(row)]
+        status_states = [parse_state(row[index]) for index in state.status_columns if index < len(row)]
+        analog_values = [
+            parse_number(row[index])
+            for index in state.analog_columns
+            if index < len(row) and analysis.metas[index].metric in {"active_power", "current", "vsd_feedback", "flow"}
+        ]
+        analog_values = [value for value in analog_values if value is not None]
+
+        command_on = any(value == 1 for value in command_states)
+        status_on = any(value == 1 for value in status_states)
+        status_off = bool(status_states) and not status_on
+        analog_high = any(abs(value) > analog_near_zero_threshold("active_power") for value in analog_values)
+        analog_zero = bool(analog_values) and not analog_high
+
+        set_mismatch(
+            analysis,
+            f"{state.equipment}:command_on_status_off",
+            command_on and status_off,
+            lambda state=state, timestamp=timestamp: EventRecord(
+                timestamp,
+                state.equipment,
+                "command_status_mismatch",
+                "command/status",
+                "Warning",
+                f"Command appears ON but status remains OFF for about {COMMAND_RESPONSE_DELAY_MINUTES} minutes.",
+            ),
+        )
+        set_mismatch(
+            analysis,
+            f"{state.equipment}:status_on_analog_zero",
+            status_on and analog_zero,
+            lambda state=state, timestamp=timestamp: EventRecord(
+                timestamp,
+                state.equipment,
+                "status_on_no_analog_evidence",
+                "status with power/current/VSD",
+                "Warning",
+                "Status appears ON while power/current/VSD feedback remains near zero.",
+            ),
+        )
+        set_mismatch(
+            analysis,
+            f"{state.equipment}:status_off_analog_high",
+            status_off and analog_high,
+            lambda state=state, timestamp=timestamp: EventRecord(
+                timestamp,
+                state.equipment,
+                "status_off_analog_high",
+                "status with power/current/VSD",
+                "Warning",
+                "Status appears OFF while power/current/VSD feedback remains high.",
+            ),
+        )
+
+
+def close_active_period(analysis: TrendAnalysis, index: int, end_time: datetime | None, end_row: int) -> None:
+    period = analysis.active_periods.pop(index, None)
+    if period is None:
+        return
+    period.end_time = end_time
+    period.end_row = end_row
+    meta = analysis.metas[index]
+    state = analysis.equipment.get(meta.equipment)
+    if state:
+        state.periods.append(period)
+        duration = period_duration_minutes(period)
+        if duration and duration < SHORT_CYCLE_MINUTES and meta.metric in {"run_status", "status", "valve_open_status"}:
+            state.short_cycles += 1
+
+
+def update_analysis(analysis: TrendAnalysis, row: list[str]) -> None:
+    analysis.rows_read += 1
+    timestamp = parse_timestamp(row[analysis.datetime_index]) if analysis.datetime_index is not None and analysis.datetime_index < len(row) else None
+    if timestamp:
+        if analysis.first_timestamp is None:
+            analysis.first_timestamp = timestamp
+        if analysis.previous_timestamp:
+            delta = int((timestamp - analysis.previous_timestamp).total_seconds())
+            if delta == 0:
+                analysis.duplicate_timestamps += 1
+            elif delta > 0:
+                analysis.interval_seconds[delta] += 1
+                expected = analysis.interval_seconds.most_common(1)[0][0] if analysis.interval_seconds else delta
+                if expected > 0 and delta > expected * 3:
+                    analysis.data_gaps += 1
+        analysis.previous_timestamp = timestamp
+        analysis.last_timestamp = timestamp
+
+    for meta in analysis.metas:
+        if meta.index >= len(row):
+            continue
+        value = row[meta.index]
+        if meta.is_analog:
+            number = parse_number(value)
+            if number is not None:
+                analysis.analogs[meta.index].add(number, timestamp)
+        if meta.is_discrete:
+            state = parse_state(value)
+            if state is None:
+                continue
+            previous = analysis.previous_states.get(meta.index)
+            if previous is None:
+                analysis.previous_states[meta.index] = state
+                if state == 1:
+                    analysis.active_periods[meta.index] = StatePeriod(meta.equipment, meta.name, timestamp, None, analysis.rows_read, analysis.rows_read, state)
+                continue
+            if previous == state:
+                continue
+            analysis.previous_states[meta.index] = state
+            equipment_state = analysis.equipment.get(meta.equipment)
+            if state == 1:
+                if meta.metric in {"run_status", "status", "valve_open_status"} and equipment_state:
+                    equipment_state.starts += 1
+                analysis.active_periods[meta.index] = StatePeriod(meta.equipment, meta.name, timestamp, None, analysis.rows_read, analysis.rows_read, state)
+                if meta.is_alarm:
+                    analysis.events.append(EventRecord(timestamp, meta.equipment, meta.metric, meta.name, "High", f"{meta.name} became active."))
+            else:
+                if meta.metric in {"run_status", "status", "valve_open_status"} and equipment_state:
+                    equipment_state.stops += 1
+                close_active_period(analysis, meta.index, timestamp, analysis.rows_read)
+
+    update_chart_bucket(analysis, row, timestamp)
+    evaluate_equipment_rules(analysis, row, timestamp)
+
+
+def finalize_analysis(analysis: TrendAnalysis) -> TrendAnalysis:
+    for index in list(analysis.active_periods):
+        close_active_period(analysis, index, analysis.last_timestamp, analysis.rows_read)
+    compress_chart_buckets(analysis)
+    add_generic_findings(analysis)
+    return analysis
+
+
+def merge_chart_buckets(buckets: list[ChartBucket]) -> ChartBucket:
+    first = buckets[0]
+    merged = ChartBucket(first.start, first.row_start, buckets[-1].row_end, {}, {})
+    for bucket in buckets:
+        for name, values in bucket.values.items():
+            merged.values.setdefault(name, []).extend(values)
+        for name, states in bucket.states.items():
+            merged.states.setdefault(name, []).extend(states)
+    return merged
+
+
+def compress_chart_buckets(analysis: TrendAnalysis) -> None:
+    if len(analysis.chart_buckets) <= MAX_CHART_POINTS:
+        return
+    group_size = math.ceil(len(analysis.chart_buckets) / MAX_CHART_POINTS)
+    compressed: list[ChartBucket] = []
+    for index in range(0, len(analysis.chart_buckets), group_size):
+        compressed.append(merge_chart_buckets(analysis.chart_buckets[index:index + group_size]))
+    analysis.chart_buckets = compressed[:MAX_CHART_POINTS]
+    analysis.bucket_size_rows *= group_size
+
+
+def period_duration_minutes(period: StatePeriod) -> float:
+    if period.start_time and period.end_time:
+        return max((period.end_time - period.start_time).total_seconds() / 60, 0.0)
+    return max(period.end_row - period.start_row, 0)
+
+
+def equipment_on_minutes(state: EquipmentState) -> float:
+    return sum(period_duration_minutes(period) for period in state.periods if period.state == 1)
+
+
+def equipment_longest_run_minutes(state: EquipmentState) -> float:
+    periods = [period_duration_minutes(period) for period in state.periods if period.state == 1]
+    return max(periods) if periods else 0.0
+
+
+def trend_duration_minutes(analysis: TrendAnalysis) -> float:
+    if analysis.first_timestamp and analysis.last_timestamp:
+        return max((analysis.last_timestamp - analysis.first_timestamp).total_seconds() / 60, 0.0)
+    return float(analysis.rows_read)
+
+
+def add_generic_findings(analysis: TrendAnalysis) -> None:
+    if analysis.datetime_index is None:
+        analysis.events.append(EventRecord(None, "Data Quality", "missing_datetime", "headers", "Warning", "No datetime column was confidently detected; operation timing is limited."))
+    if analysis.data_gaps:
+        analysis.events.append(EventRecord(None, "Data Quality", "data_gap", "timestamp interval", "Warning", f"{analysis.data_gaps} large timestamp gap(s) were detected."))
+    if analysis.duplicate_timestamps:
+        analysis.events.append(EventRecord(None, "Data Quality", "duplicate_timestamp", "timestamp", "Warning", f"{analysis.duplicate_timestamps} duplicate timestamp sample(s) were detected."))
+    for state in analysis.equipment.values():
+        if state.short_cycles:
+            analysis.events.append(EventRecord(None, state.equipment, "short_cycle", "run status periods", "Warning", f"{state.short_cycles} short run period(s) below {SHORT_CYCLE_MINUTES} minutes were detected."))
+    for analog in analysis.analogs.values():
+        if analog.count >= 10 and analog.std_dev < 0.0001:
+            analysis.events.append(EventRecord(None, analog.equipment, "constant_analog", analog.column, "Info", "Analog value is mostly constant and may not be useful for charting."))
 def new_stats(headers: list[str]) -> tuple[list[NumericStat], list[Counter[str]]]:
     stats = [NumericStat(header, index, classify_column(header)) for index, header in enumerate(headers)]
     counters = [Counter() for _ in headers]
@@ -233,23 +863,104 @@ def build_report(source: Path, rows_read: int, output_files: list[Path], stats: 
     return "\n".join(lines)
 
 
-def write_analysis_sheet(workbook: Any, source: Path, rows_read: int, rows_written: int, stats: list[NumericStat], counters: list[Counter[str]], output_kind: str) -> None:
+def estimate_initial_bucket_size(source: Path) -> int:
+    size = source.stat().st_size
+    if size >= 300 * 1024 * 1024:
+        return 5000
+    if size >= 100 * 1024 * 1024:
+        return 2000
+    if size >= 20 * 1024 * 1024:
+        return 500
+    return 1
+
+
+def build_key_findings(analysis: TrendAnalysis) -> list[str]:
+    systems = sorted({meta.equipment for meta in analysis.metas if meta.equipment != "Unknown Equipment"})
+    findings = []
+    if systems:
+        findings.append(f"Trend contains detected BMS / ACMV equipment groups: {', '.join(systems[:8])}.")
+    else:
+        findings.append("Trend equipment could not be confidently grouped from column names; review BMS point mapping.")
+    if analysis.first_timestamp and analysis.last_timestamp:
+        findings.append(
+            f"Data covers {format_dt(analysis.first_timestamp)} to {format_dt(analysis.last_timestamp)}, approximately {format_duration(trend_duration_minutes(analysis))}."
+        )
+    if analysis.interval_seconds:
+        interval = analysis.interval_seconds.most_common(1)[0][0]
+        findings.append(f"Estimated sampling interval is about {format_duration(interval / 60)}.")
+    running = [state.equipment for state in analysis.equipment.values() if equipment_on_minutes(state) > 0]
+    if running:
+        findings.append(f"Operation was detected for: {', '.join(running[:8])}.")
+    alarm_count = sum(1 for event in analysis.events if event.severity == "High")
+    if alarm_count:
+        findings.append(f"{alarm_count} alarm/trip/fail/lockout transition(s) were detected and should be reviewed.")
+    if analysis.data_gaps or analysis.duplicate_timestamps:
+        findings.append("Timestamp quality issues were detected; confirm trend export interval before final engineering conclusions.")
+    useful_analogs = [analog for analog in analysis.analogs.values() if analog.count and analog.nonzero_count]
+    if useful_analogs:
+        findings.append(f"{len(useful_analogs)} meaningful analog trend(s) were detected for power/current/VSD/temperature/pressure/flow review.")
+    findings.append("No final conclusion should be made without verifying BMS point mapping, command logic, and alarm definitions.")
+    return findings[:10]
+
+
+def write_table_row(worksheet: Any, row: int, values: list[Any], fmt: Any) -> None:
+    for col, value in enumerate(values):
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            worksheet.write_number(row, col, value, fmt)
+        else:
+            worksheet.write(row, col, value, fmt)
+
+
+def write_chart_helper(workbook: Any, analysis: TrendAnalysis) -> Any:
+    helper = workbook.add_worksheet("_ChartHelper")
+    helper.hide()
+    headers = ["Time"]
+    analog_names = [analysis.headers[index] for index in analysis.chart_columns]
+    status_names = [analysis.headers[index] for index in analysis.chart_status_columns]
+    headers.extend(analog_names)
+    headers.extend(status_names)
+    for col, header in enumerate(headers):
+        helper.write(0, col, header)
+    for row_index, bucket in enumerate(analysis.chart_buckets[:MAX_CHART_POINTS], start=1):
+        helper.write(row_index, 0, format_dt(bucket.start) if bucket.start else str(bucket.row_start))
+        col = 1
+        for name in analog_names:
+            values = bucket.values.get(name, [])
+            helper.write_number(row_index, col, sum(values) / len(values) if values else 0)
+            col += 1
+        for name in status_names:
+            values = bucket.states.get(name, [])
+            helper.write_number(row_index, col, max(values) if values else 0)
+            col += 1
+    return helper
+
+
+def write_analysis_sheet(workbook: Any, source: Path, rows_read: int, rows_written: int, analysis: TrendAnalysis, output_kind: str) -> None:
     worksheet = workbook.add_worksheet("Analysis")
     title_format = workbook.add_format({"bold": True, "font_size": 16, "font_color": "white", "bg_color": "#0F172A", "align": "center"})
     section_format = workbook.add_format({"bold": True, "font_color": "white", "bg_color": "#334155", "border": 1})
+    header_format = workbook.add_format({"bold": True, "font_color": "white", "bg_color": "#475569", "border": 1, "text_wrap": True})
     value_format = workbook.add_format({"border": 1, "text_wrap": True, "valign": "top"})
     number_format = workbook.add_format({"border": 1, "num_format": "#,##0.00"})
     percent_format = workbook.add_format({"border": 1, "num_format": "0.0%"})
-    worksheet.set_column("A:A", 28)
-    worksheet.set_column("B:H", 18)
-    worksheet.merge_range("A1:H1", "BMS / ACMV Trend Analysis", title_format)
+    warning_format = workbook.add_format({"border": 1, "text_wrap": True, "valign": "top", "bg_color": "#FEF2F2", "font_color": "#991B1B"})
+    worksheet.set_column("A:A", 24)
+    worksheet.set_column("B:B", 28)
+    worksheet.set_column("C:H", 18)
+    worksheet.merge_range("A1:H1", "BMS / ACMV Operation Analysis Report", title_format)
+    systems = sorted({meta.equipment for meta in analysis.metas if meta.equipment != "Unknown Equipment"})
     overview = [
         ("File", source.name),
         ("Source size", f"{source.stat().st_size:,} bytes"),
         ("Rows read", rows_read),
-        ("Rows written", rows_written),
+        ("Columns", len(analysis.headers)),
+        ("Date/time range", f"{format_dt(analysis.first_timestamp)} to {format_dt(analysis.last_timestamp)}"),
+        ("Duration", format_duration(trend_duration_minutes(analysis))),
+        ("Sampling interval estimate", format_duration((analysis.interval_seconds.most_common(1)[0][0] / 60) if analysis.interval_seconds else 0)),
+        ("Detected systems", ", ".join(systems[:12]) if systems else "Unknown"),
         ("Output", output_kind),
         ("Excel sheet split", "Automatic at 1,048,576 rows per sheet"),
+        ("Chart data mode", f"Aggregated every {analysis.bucket_size_rows:,} row(s)" if analysis.bucket_size_rows > 1 else "Raw rows used; under chart threshold"),
     ]
     worksheet.write("A3", "Overview", section_format)
     worksheet.write("B3", "Value", section_format)
@@ -257,47 +968,141 @@ def write_analysis_sheet(workbook: Any, source: Path, rows_read: int, rows_writt
         worksheet.write(index, 0, label, value_format)
         worksheet.write(index, 1, value, value_format)
 
-    worksheet.write("A12", "Numeric Analysis", section_format)
-    for offset, header in enumerate(["Column", "Count", "Average", "Min", "Max", "Latest", "Change", "Std Dev"]):
-        worksheet.write(12, offset, header, section_format)
-    for row_index, stat in enumerate(sorted((item for item in stats if item.count), key=lambda item: item.count, reverse=True)[:25], start=13):
-        worksheet.write(row_index, 0, stat.column, value_format)
-        worksheet.write_number(row_index, 1, stat.count, number_format)
-        worksheet.write_number(row_index, 2, stat.mean, number_format)
-        worksheet.write_number(row_index, 3, stat.minimum or 0, number_format)
-        worksheet.write_number(row_index, 4, stat.maximum or 0, number_format)
-        worksheet.write_number(row_index, 5, stat.latest or 0, number_format)
-        worksheet.write_number(row_index, 6, stat.change, number_format)
-        worksheet.write_number(row_index, 7, stat.std_dev, number_format)
+    row = 16
+    worksheet.write(row, 0, "Key Findings", section_format)
+    row += 1
+    for finding in build_key_findings(analysis):
+        worksheet.write(row, 0, "-", value_format)
+        worksheet.merge_range(row, 1, row, 7, finding, value_format)
+        row += 1
 
-    status_start = 42
-    worksheet.write(status_start, 0, "Status Analysis", section_format)
-    for offset, header in enumerate(["Column", "States", "Top State", "Top State %", "Active Events", "Active %"]):
-        worksheet.write(status_start + 1, offset, header, section_format)
-    out_row = status_start + 2
-    for stat, counter in zip(stats, counters, strict=False):
-        if not counter:
+    row += 1
+    worksheet.write(row, 0, "Detected Equipment", section_format)
+    row += 1
+    for col, header in enumerate(["Equipment group", "Detected columns", "Command/status", "Analog data", "Alarm/trip/fail", "VSD feedback", "Runtime"]):
+        worksheet.write(row, col, header, header_format)
+    row += 1
+    for state in sorted(analysis.equipment.values(), key=lambda item: item.equipment):
+        write_table_row(
+            worksheet,
+            row,
+            [
+                state.equipment,
+                len(state.columns),
+                "Yes" if state.command_columns or state.status_columns else "No",
+                "Yes" if state.analog_columns else "No",
+                "Yes" if state.alarm_columns else "No",
+                "Yes" if state.vsd_columns else "No",
+                "Yes" if state.runtime_columns else "No",
+            ],
+            value_format,
+        )
+        row += 1
+
+    row += 2
+    worksheet.write(row, 0, "Equipment Operation Summary", section_format)
+    row += 1
+    op_headers = ["Equipment", "First start", "Last stop", "Starts", "Stops", "Total ON", "ON %", "Longest run", "Short cycles", "Comment"]
+    for col, header in enumerate(op_headers):
+        worksheet.write(row, col, header, header_format)
+    row += 1
+    total_minutes = max(trend_duration_minutes(analysis), 1)
+    for state in sorted(analysis.equipment.values(), key=lambda item: equipment_on_minutes(item), reverse=True):
+        if not state.status_columns and not state.periods:
             continue
-        total = max(sum(counter.values()), 1)
-        top_state, top_count = counter.most_common(1)[0]
-        active = sum(count for value, count in counter.items() if value.lower() in ACTIVE_STATUS_VALUES)
-        worksheet.write(out_row, 0, stat.column, value_format)
-        worksheet.write_number(out_row, 1, len(counter), number_format)
-        worksheet.write(out_row, 2, top_state, value_format)
-        worksheet.write_number(out_row, 3, top_count / total, percent_format)
-        worksheet.write_number(out_row, 4, active, number_format)
-        worksheet.write_number(out_row, 5, active / total, percent_format)
-        out_row += 1
+        periods = [period for period in state.periods if period.state == 1]
+        first_start = min((period.start_time for period in periods if period.start_time), default=None)
+        last_stop = max((period.end_time for period in periods if period.end_time), default=None)
+        on_minutes = equipment_on_minutes(state)
+        comment = "Review short cycling." if state.short_cycles else ("Operation detected." if on_minutes else "No ON period detected.")
+        write_table_row(
+            worksheet,
+            row,
+            [
+                state.equipment,
+                format_dt(first_start),
+                format_dt(last_stop),
+                state.starts,
+                state.stops,
+                format_duration(on_minutes),
+                on_minutes / total_minutes,
+                format_duration(equipment_longest_run_minutes(state)),
+                state.short_cycles,
+                comment,
+            ],
+            value_format,
+        )
+        worksheet.write_number(row, 6, on_minutes / total_minutes, percent_format)
+        row += 1
+
+    row += 2
+    worksheet.write(row, 0, "Abnormal Events / Data Quality", section_format)
+    row += 1
+    for col, header in enumerate(["Timestamp", "Equipment", "Issue type", "Evidence", "Severity", "Comment"]):
+        worksheet.write(row, col, header, header_format)
+    row += 1
+    events = analysis.events[:100] or [EventRecord(None, "Trend", "none", "", "Info", "No alarm/trip/fail/lockout transitions detected by generic rules.")]
+    for event in events:
+        fmt = warning_format if event.severity in {"High", "Warning"} else value_format
+        write_table_row(worksheet, row, [format_dt(event.timestamp), event.equipment, event.issue_type, event.evidence, event.severity, event.comment], fmt)
+        row += 1
+
+    row += 2
+    worksheet.write(row, 0, "Analog Trend Summary", section_format)
+    row += 1
+    for col, header in enumerate(["Equipment", "Metric", "Column", "Min", "Max", "Average", "Latest", "Max time", "Zero %", "Comment"]):
+        worksheet.write(row, col, header, header_format)
+    row += 1
+    analogs = sorted((analog for analog in analysis.analogs.values() if analog.count), key=lambda item: (item.equipment, item.metric, item.column))[:40]
+    for analog in analogs:
+        zero_pct = analog.zero_count / max(analog.count, 1)
+        comment = "Mostly zero; verify equipment run status." if zero_pct > 0.95 else ("Mostly constant; limited chart value." if analog.std_dev < 0.0001 else "Useful analog trend.")
+        write_table_row(
+            worksheet,
+            row,
+            [analog.equipment, analog.metric, analog.column, analog.minimum or 0, analog.maximum or 0, analog.mean, analog.latest or 0, format_dt(analog.max_time), zero_pct, comment],
+            value_format,
+        )
+        for col in [3, 4, 5, 6]:
+            worksheet.write_number(row, col, [analog.minimum or 0, analog.maximum or 0, analog.mean, analog.latest or 0][col - 3], number_format)
+        worksheet.write_number(row, 8, zero_pct, percent_format)
+        row += 1
+
+    helper = write_chart_helper(workbook, analysis)
+    chart_start = row + 2
+    worksheet.write(chart_start, 0, "Charts", section_format)
+    point_count = min(len(analysis.chart_buckets), MAX_CHART_POINTS)
+    if point_count >= 2:
+        if analysis.chart_status_columns:
+            status_chart = workbook.add_chart({"type": "line"})
+            for series_index, column_index in enumerate(analysis.chart_status_columns[:6], start=1 + len(analysis.chart_columns)):
+                status_chart.add_series({
+                    "name": ["_ChartHelper", 0, series_index],
+                    "categories": ["_ChartHelper", 1, 0, point_count, 0],
+                    "values": ["_ChartHelper", 1, series_index, point_count, series_index],
+                })
+            status_chart.set_title({"name": "Equipment Run Status Timeline"})
+            status_chart.set_y_axis({"name": "State", "min": 0, "max": 1})
+            worksheet.insert_chart(chart_start + 1, 0, status_chart, {"x_scale": 1.4, "y_scale": 1.1})
+        if analysis.chart_columns:
+            analog_chart = workbook.add_chart({"type": "line"})
+            for series_index, _column_index in enumerate(analysis.chart_columns[:5], start=1):
+                analog_chart.add_series({
+                    "name": ["_ChartHelper", 0, series_index],
+                    "categories": ["_ChartHelper", 1, 0, point_count, 0],
+                    "values": ["_ChartHelper", 1, series_index, point_count, series_index],
+                })
+            analog_chart.set_title({"name": "Selected Analog Trends"})
+            worksheet.insert_chart(chart_start + 18, 0, analog_chart, {"x_scale": 1.4, "y_scale": 1.1})
 
 
 def process_xlsx(source: Path, output_dir: Path, progress: Any) -> ProcessResult:
     import xlsxwriter
 
+    progress(0, "Detecting CSV columns.")
     output_path = output_dir / f"{source.stem}.xlsx"
     workbook = xlsxwriter.Workbook(output_path, {"constant_memory": True, "strings_to_urls": False, "use_zip64": True})
     header_format = workbook.add_format({"bold": True, "bg_color": "#1F2937", "font_color": "white", "border": 1})
-    text_format = workbook.add_format({"valign": "top"})
-    number_format = workbook.add_format({"num_format": "#,##0.00", "valign": "top"})
 
     iterator = iter_csv(source)
     try:
@@ -307,6 +1112,9 @@ def process_xlsx(source: Path, output_dir: Path, progress: Any) -> ProcessResult
         raise ValueError("CSV file is empty.") from exc
 
     stats, counters = new_stats(headers)
+    analysis = build_analyzer(headers)
+    analysis.bucket_size_rows = estimate_initial_bucket_size(source)
+    progress(0, "Writing Data sheet and analyzing rows.")
     sheet_index = 1
     rows_on_sheet = 0
     rows_read = 0
@@ -329,23 +1137,26 @@ def process_xlsx(source: Path, output_dir: Path, progress: Any) -> ProcessResult
             rows_on_sheet = 0
         row = fit_row(raw_row, len(headers))
         update_profiles(row, stats, counters)
+        update_analysis(analysis, row)
         excel_row = rows_on_sheet + 1
         for col, value in enumerate(row):
             number = parse_number(value)
             if number is not None:
-                worksheet.write_number(excel_row, col, number, number_format)
+                worksheet.write_number(excel_row, col, number)
             elif value:
-                worksheet.write(excel_row, col, value, text_format)
+                worksheet.write(excel_row, col, value)
             else:
-                worksheet.write_blank(excel_row, col, None, text_format)
+                worksheet.write_blank(excel_row, col, None)
         rows_on_sheet += 1
         total_rows_written += 1
         if rows_read % 10000 == 0:
-            progress(rows_read)
+            progress(rows_read, f"Analyzing rows and writing Data sheet: {rows_read:,} rows.")
 
-    write_analysis_sheet(workbook, source, rows_read, total_rows_written, stats, counters, "xlsx")
+    finalize_analysis(analysis)
+    progress(rows_read, "Writing Analysis sheet and embedded charts.")
+    write_analysis_sheet(workbook, source, rows_read, total_rows_written, analysis, "xlsx")
     workbook.close()
-    progress(rows_read)
+    progress(rows_read, "Workbook created.")
     report = build_report(source, rows_read, [output_path], stats, counters)
     return ProcessResult(rows_read=rows_read, output_files=[output_path], report=report)
 
@@ -450,8 +1261,10 @@ def process_csv(source: Path, output_dir: Path, output_format: OutputFormat, pro
     report_path = output_dir / "conversion_report.txt"
     report_path.write_text(result.report, encoding="utf-8")
     archive_path = output_dir / f"{source.stem}-{output_format}.zip"
+    progress(result.rows_read, "Creating output ZIP.")
     with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_DEFLATED, allowZip64=True) as archive:
         for output_file in result.output_files:
             archive.write(output_file, output_file.name)
         archive.write(report_path, report_path.name)
+    progress(result.rows_read, "Completed ZIP output.")
     return archive_path

@@ -6,9 +6,8 @@ Large-file BMS / ACMV CSV trend converter with a Vercel frontend and a dedicated
 
 1. Open the web page.
 2. Select one or more CSV files.
-3. Choose `XLSX`, `SQLite`, or `Parquet`.
-4. Upload and process the job.
-5. Download the completed output ZIP.
+3. Upload and process the XLSX analysis job.
+4. Download the completed output ZIP.
 
 The frontend can run on Vercel. Large CSV processing runs on the FastAPI backend, not in Vercel serverless functions and not in the browser.
 
@@ -16,12 +15,14 @@ The frontend can run on Vercel. Large CSV processing runs on the FastAPI backend
 
 The backend streams upload chunks to disk, then streams CSV rows from disk into the selected output format. The full CSV is not read into memory.
 
+For large files, embedded charts do not use every raw row. The backend creates hidden `_ChartHelper` aggregate data and caps chart points so Excel files remain practical to open.
+
 ## Output
 
 - XLSX output with automatic `Data_N` sheet splitting at Excel's 1,048,576 row limit
-- SQLite output for large local/database analysis
-- Parquet output for columnar analytics
-- BMS / ACMV numeric and status summaries
+- BMS / ACMV operation analysis report in the `Analysis` worksheet
+- Equipment detection for chillers, CHW pumps, condenser pumps, cooling towers, AHU/FCU/fans, valves, VSD/VFD points, MCC/power meters, and unknown equipment
+- Start/stop operation summaries, alarm/trip/fail/lockout events, abnormal condition notes, analog trend summaries, and embedded charts
 - `conversion_report.txt` inside the output ZIP
 
 ## Browser Support

@@ -3,7 +3,6 @@ import type { ChangeEvent } from 'react';
 import {
   AlertCircle,
   CheckCircle2,
-  Database,
   Download,
   FileSpreadsheet,
   Loader2,
@@ -28,6 +27,8 @@ interface QueueFile {
   outputReady?: boolean;
   outputExists?: boolean;
   outputSize?: number;
+  startedAt?: number;
+  finishedAt?: number;
 }
 
 interface BackendJob {
@@ -132,7 +133,7 @@ function filenameFromDisposition(disposition: string | null, fallback: string) {
 export default function App() {
   const inputRef = useRef<HTMLInputElement>(null);
   const [files, setFiles] = useState<QueueFile[]>([]);
-  const [outputFormat, setOutputFormat] = useState<OutputFormat>('xlsx');
+  const [outputFormat] = useState<OutputFormat>('xlsx');
   const [isRunning, setIsRunning] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [progressMessage, setProgressMessage] = useState('Select large BMS / ACMV CSV files, then upload to the processing backend.');
@@ -220,6 +221,7 @@ export default function App() {
     for (const item of files) {
       try {
         updateFile(item.id, { status: 'uploading', uploadProgress: 0, error: undefined, message: 'Uploading file.' });
+        updateFile(item.id, { startedAt: Date.now(), finishedAt: undefined });
         setProgressMessage(`Uploading ${item.file.name}...`);
         const created = await uploadFile(item.file, outputFormat, progress => updateFile(item.id, { uploadProgress: progress }));
         updateFile(item.id, {
@@ -259,11 +261,12 @@ export default function App() {
           outputExists: finalJob.output_exists,
           outputSize: finalJob.output_size,
           downloadUrl: `${API_BASE}/api/jobs/${finalJob.id}/download`,
+          finishedAt: Date.now(),
         });
         setProgressMessage(`${item.file.name} completed and is ready to download.`);
       } catch (error) {
         const message = error instanceof Error ? error.message : 'Unexpected conversion error.';
-        updateFile(item.id, { status: 'failed', error: message, message });
+        updateFile(item.id, { status: 'failed', error: message, message, finishedAt: Date.now() });
         setErrorMessage(message);
       }
     }
@@ -299,28 +302,14 @@ export default function App() {
               </p>
             </div>
 
-            <div className="mt-5 grid grid-cols-1 gap-3 sm:grid-cols-3">
-              {(['xlsx', 'sqlite', 'parquet'] as OutputFormat[]).map(format => (
-                <button
-                  key={format}
-                  type="button"
-                  onClick={() => setOutputFormat(format)}
-                  disabled={isRunning}
-                  className={`rounded-lg border p-4 text-left uppercase transition ${
-                    outputFormat === format ? 'border-slate-900 bg-white shadow-sm' : 'border-slate-200 bg-slate-50 hover:bg-white'
-                  } disabled:opacity-40`}
-                >
-                  <span className="flex items-center gap-2 text-sm font-semibold">
-                    {format === 'xlsx' ? <FileSpreadsheet className="h-4 w-4" /> : <Database className="h-4 w-4" />}
-                    {format}
-                  </span>
-                  <span className="mt-1 block text-xs normal-case leading-5 text-slate-500">
-                    {format === 'xlsx' && 'Excel workbook with automatic sheet splitting.'}
-                    {format === 'sqlite' && 'Database output for larger analysis workflows.'}
-                    {format === 'parquet' && 'Columnar analytics format for downstream tools.'}
-                  </span>
-                </button>
-              ))}
+            <div className="mt-5 rounded-lg border border-slate-900 bg-white p-4 text-left">
+              <span className="flex items-center gap-2 text-sm font-semibold uppercase">
+                <FileSpreadsheet className="h-4 w-4" />
+                XLSX
+              </span>
+              <span className="mt-1 block text-xs leading-5 text-slate-500">
+                Excel workbook with streamed Data sheets and a BMS / ACMV operation analysis report.
+              </span>
             </div>
 
             <input ref={inputRef} type="file" accept=".csv,text/csv" multiple className="hidden" onChange={handleFileChange} />
@@ -367,6 +356,11 @@ export default function App() {
                             {item.message || 'Ready.'}
                             {item.rowsProcessed ? ` ${item.rowsProcessed.toLocaleString()} rows processed.` : ''}
                           </p>
+                          {item.startedAt && (
+                            <p className="mt-1 text-xs text-slate-500">
+                              Elapsed: {Math.max(0, Math.round(((item.finishedAt || Date.now()) - item.startedAt) / 1000)).toLocaleString()} sec
+                            </p>
+                          )}
                           {item.error && <p className="mt-1 text-xs text-rose-600">{item.error}</p>}
                           {item.jobId && (
                             <div className="mt-2 space-y-1 rounded-lg bg-white p-2 text-[11px] leading-4 text-slate-500">
