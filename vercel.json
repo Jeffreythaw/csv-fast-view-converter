@@ -4,18 +4,7 @@
   "installCommand": "npm ci",
   "outputDirectory": "dist",
   "framework": "vite",
-  "functions": {
-    "api/convert.py": {
-      "maxDuration": 60,
-      "memory": 1024,
-      "excludeFiles": "{node_modules/**,dist/**,assets/**,.playwright-mcp/**,**/__pycache__/**,**/*.pyc,tmp-*.csv}"
-    }
-  },
   "rewrites": [
-    {
-      "source": "/api/convert",
-      "destination": "/api/convert.py"
-    },
     {
       "source": "/(.*)",
       "destination": "/index.html"

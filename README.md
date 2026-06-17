@@ -1,49 +1,28 @@
 # CSV Fast View Converter
 
-React + Vite frontend with a Python backend for BMS / ACMV trend analysis. Small CSV files can be uploaded to `/api/convert` on Vercel. Large CSV files should use Local Folder Mode, where the web UI talks to a local Python companion server and the CSV data never leaves the user's computer.
+Browser-based BMS / ACMV trend analyzer for CSV exports.
 
-## Features
+## User Workflow
 
-- Batch CSV upload with drag and drop
-- Python backend conversion via `POST /api/convert`
-- Local large-file conversion via `http://127.0.0.1:8765/api/local/convert`
-- CSV file path or folder path input for files too large for Vercel uploads
-- BMS / ACMV keyword-based column classification
-- Date/time detection and sorting
-- Numeric and status analysis tables
-- Excel workbooks with visible `Data` and `Analysis` sheets only
-- Hidden `_ChartHelper` sheet for embedded Excel charts
-- ZIP output with converted workbooks and `conversion_report.txt`
+1. Open the web page.
+2. Select a CSV folder or CSV files.
+3. Click **Convert to ZIP**.
+4. Download `hbl-bms-trend-analysis.zip`.
 
-## Local Development
+No Python, terminal commands, local server, or package installation is required for end users. CSV files stay on the user's computer and are processed in the browser.
 
-Prerequisite: Node.js 20 or newer.
+## Output
+
+- One `.xlsx` workbook per CSV file
+- Visible `Data` and `Analysis` sheets
+- BMS / ACMV keyword-based numeric and status analysis
+- `conversion_report.txt` inside the ZIP package
+
+## Development
 
 ```bash
 npm install
-python3 -m pip install -r requirements.txt
 npm run dev
-```
-
-## Large File Workflow
-
-Vercel serverless functions cannot receive large request bodies, so files over 4.5 MB should not be uploaded through the hosted API. Start the local companion server on the user's machine:
-
-```bash
-npm run local-api
-```
-
-Then open the web UI, choose **Local Folder Mode**, and paste either:
-
-- one CSV file path per line
-- a folder path containing CSV files
-
-The converter writes `hbl-bms-trend-analysis.zip` into the selected output folder. This is the recommended path for 73 MB, 1 GB, and other large BMS trend exports.
-
-Direct local CLI conversion is also available:
-
-```bash
-python3 api/convert.py --out /path/to/hbl-bms-trend-analysis.zip /path/to/csv-or-folder
 ```
 
 ## Checks
@@ -53,11 +32,9 @@ npm run lint
 npm run build
 ```
 
-## Vercel
+## Deployment
 
-Vercel deploys the Vite frontend and Python serverless function:
+Vercel builds the Vite frontend:
 
 - Build command: `npm run build`
 - Output directory: `dist`
-- API endpoint: `/api/convert`
-- Large-file endpoint: local companion only, not Vercel
