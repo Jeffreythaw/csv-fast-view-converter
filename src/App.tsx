@@ -30,6 +30,8 @@ interface QueueFile {
   outputSize?: number;
   startedAt?: number;
   finishedAt?: number;
+  detectedDelimiter?: string;
+  detectedColumns?: number;
 }
 
 interface BackendJob {
@@ -47,6 +49,8 @@ interface BackendJob {
   output_ready: boolean;
   output_exists: boolean;
   output_size: number;
+  detected_delimiter?: string;
+  detected_columns?: number;
 }
 
 const API_BASE = (import.meta.env.VITE_API_BASE || 'http://localhost:8000').replace(/\/$/, '');
@@ -242,6 +246,8 @@ export default function App() {
           outputSize: created.output_size,
           downloadUrl: `${API_BASE}/api/jobs/${created.id}/download`,
           uploadProgress: 100,
+          detectedDelimiter: created.detected_delimiter,
+          detectedColumns: created.detected_columns,
         });
 
         setProgressMessage(`${item.file.name} queued. Waiting for backend processing...`);
@@ -256,6 +262,8 @@ export default function App() {
             outputExists: job.output_exists,
             outputSize: job.output_size,
             downloadUrl: `${API_BASE}/api/jobs/${job.id}/download`,
+            detectedDelimiter: job.detected_delimiter,
+            detectedColumns: job.detected_columns,
           });
         });
 
@@ -271,6 +279,8 @@ export default function App() {
           outputSize: finalJob.output_size,
           downloadUrl: `${API_BASE}/api/jobs/${finalJob.id}/download`,
           finishedAt: Date.now(),
+          detectedDelimiter: finalJob.detected_delimiter,
+          detectedColumns: finalJob.detected_columns,
         });
         setProgressMessage(`${item.file.name} completed and is ready to download.`);
       } catch (error) {
@@ -381,6 +391,25 @@ export default function App() {
                                 ready={String(Boolean(item.outputReady))}, exists={String(Boolean(item.outputExists))}, size={formatBytes(item.outputSize || 0)}
                               </p>
                               {item.downloadStatus && <p className="break-all"><span className="font-semibold text-slate-700">Download status:</span> {item.downloadStatus}</p>}
+                              {(item.detectedDelimiter !== undefined || item.detectedColumns !== undefined) && (
+                                <p>
+                                  {item.detectedDelimiter !== undefined && (
+                                    <span>
+                                      <span className="font-semibold text-slate-700">Detected Delimiter:</span>{' '}
+                                      <code className="rounded bg-slate-100 px-1 font-mono text-[10px] text-emerald-700 font-bold">
+                                        {item.detectedDelimiter === '\t' ? '\\t' : item.detectedDelimiter || 'None'}
+                                      </code>
+                                    </span>
+                                  )}
+                                  {item.detectedDelimiter !== undefined && item.detectedColumns !== undefined && <span className="mx-2 text-slate-300">|</span>}
+                                  {item.detectedColumns !== undefined && (
+                                    <span>
+                                      <span className="font-semibold text-slate-700">Detected Columns:</span>{' '}
+                                      <span className="text-emerald-700 font-bold">{item.detectedColumns}</span>
+                                    </span>
+                                  )}
+                                </p>
+                              )}
                             </div>
                           )}
                         </div>

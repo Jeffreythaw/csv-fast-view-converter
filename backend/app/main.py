@@ -57,6 +57,8 @@ class Job:
     upload_path: str | None = None
     output_path: str | None = None
     cleanup_paths: list[str] = field(default_factory=list)
+    detected_delimiter: str | None = None
+    detected_columns: int | None = None
 
 
 jobs: dict[str, Job] = {}
@@ -211,8 +213,12 @@ def run_processing(job_id: str) -> None:
     job.message = "Reading file."
     touch(job)
 
-    def progress(rows: int, message: str | None = None) -> None:
+    def progress(rows: int, message: str | None = None, delimiter: str | None = None, columns: int | None = None) -> None:
         job.rows_processed = rows
+        if delimiter is not None:
+            job.detected_delimiter = delimiter
+        if columns is not None:
+            job.detected_columns = columns
         step = message or f"Processed {rows:,} rows."
         job.current_step = step
         job.message = step

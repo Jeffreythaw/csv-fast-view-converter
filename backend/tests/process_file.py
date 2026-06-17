@@ -13,7 +13,7 @@ def main() -> int:
     parser.add_argument("--format", choices=["xlsx", "sqlite", "parquet"], default="xlsx")
     args = parser.parse_args()
 
-    def progress(rows: int, message: str | None = None) -> None:
+    def progress(rows: int, message: str | None = None, *args, **kwargs) -> None:
         if message:
             print(message)
         elif rows % 100000 == 0:

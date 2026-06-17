@@ -705,20 +705,97 @@ def detect_encoding(path: Path) -> str:
     return "latin1"
 
 
-def detect_dialect(path: Path, encoding: str) -> csv.Dialect:
-    with path.open("r", encoding=encoding, errors="replace", newline="") as handle:
-        sample = handle.read(65536)
-    try:
-        return csv.Sniffer().sniff(sample, delimiters=",;\t|")
-    except csv.Error:
-        return csv.excel
-
-
-def iter_csv(path: Path):
+def detect_csv_properties(path: Path) -> tuple[str, str, int, list[str]]:
     encoding = detect_encoding(path)
-    dialect = detect_dialect(path, encoding)
+    
+    # Read first 20 non-empty lines for delimiter detection
+    lines = []
     with path.open("r", encoding=encoding, errors="replace", newline="") as handle:
-        reader = csv.reader(handle, dialect)
+        for line in handle:
+            cleaned = line.strip()
+            if cleaned:
+                lines.append(line)
+                if len(lines) == 20:
+                    break
+                    
+    if not lines:
+        raise ValueError("CSV file is empty.")
+
+    separators = [";", ",", "\t", "|"]
+    stats = {}
+    for sep in separators:
+        counts = [line.count(sep) for line in lines]
+        if not counts:
+            continue
+        counter = Counter(counts)
+        mode_val, freq = counter.most_common(1)[0]
+        stats[sep] = {
+            "mode_count": mode_val,
+            "freq": freq,
+            "total_count": sum(counts)
+        }
+
+    detected_delimiter = None
+    
+    # Check if semicolon has consistent occurrences
+    semi_stats = stats.get(";")
+    if semi_stats and semi_stats["mode_count"] > 0 and semi_stats["freq"] >= len(lines) * 0.7:
+        detected_delimiter = ";"
+    else:
+        valid_candidates = []
+        for sep, info in stats.items():
+            if info["mode_count"] > 0:
+                valid_candidates.append((sep, info))
+                
+        if valid_candidates:
+            # Sort by frequency (descending) first, then by mode_count (descending)
+            valid_candidates.sort(key=lambda x: (x[1]["freq"], x[1]["mode_count"]), reverse=True)
+            detected_delimiter = valid_candidates[0][0]
+            
+            # "If chosen delimiter gives only 1 column but semicolon gives many columns, switch to semicolon."
+            best_info = valid_candidates[0][1]
+            if best_info["mode_count"] == 0 and semi_stats and semi_stats["mode_count"] > 0:
+                detected_delimiter = ";"
+        else:
+            # Try Sniffer
+            try:
+                with path.open("r", encoding=encoding, errors="replace", newline="") as handle:
+                    sample = handle.read(65536)
+                dialect = csv.Sniffer().sniff(sample, delimiters=",;\t|")
+                detected_delimiter = dialect.delimiter
+            except Exception:
+                detected_delimiter = ","
+
+    def parse_header_line(line_str: str, delim: str) -> list[str]:
+        reader = csv.reader([line_str], delimiter=delim)
+        return next(reader)
+
+    header_line = lines[0]
+    headers_parsed = parse_header_line(header_line, detected_delimiter)
+    headers = unique_headers([clean_header(val, idx) for idx, val in enumerate(headers_parsed[:MAX_COLUMNS])])
+
+    # Validation:
+    if len(headers) <= 1 and ";" in header_line:
+        detected_delimiter = ";"
+        headers_parsed = parse_header_line(header_line, detected_delimiter)
+        headers = unique_headers([clean_header(val, idx) for idx, val in enumerate(headers_parsed[:MAX_COLUMNS])])
+        if len(headers) <= 1:
+            raise ValueError(
+                "CSV parsing failed: Only one column was parsed, but the header contains semicolons. "
+                "Semicolon-based parsing also failed."
+            )
+
+    import logging
+    proc_logger = logging.getLogger("csv_fast_view_converter")
+    proc_logger.info(f"Detected delimiter: {detected_delimiter}")
+    proc_logger.info(f"Detected columns: {len(headers)}")
+
+    return encoding, detected_delimiter, len(headers), headers
+
+
+def iter_csv(path: Path, encoding: str, delimiter: str):
+    with path.open("r", encoding=encoding, errors="replace", newline="") as handle:
+        reader = csv.reader(handle, delimiter=delimiter)
         for row in reader:
             if row and any(str(cell).strip() for cell in row):
                 yield row
@@ -1934,23 +2011,22 @@ def write_analysis_sheet(workbook: Any, source: Path, rows_read: int, rows_writt
 def process_xlsx(source: Path, output_dir: Path, progress: Any) -> ProcessResult:
     import xlsxwriter
 
-    progress(0, "Reading file and detecting CSV columns.")
+    progress(0, "Detecting CSV delimiter")
+    encoding, delimiter, col_count, headers = detect_csv_properties(source)
+    progress(0, "Parsing CSV columns", delimiter=delimiter, columns=col_count)
+    progress(0, "Writing Data sheet")
+
     output_path = output_dir / f"{source.stem}.xlsx"
     workbook = xlsxwriter.Workbook(output_path, {"constant_memory": True, "strings_to_urls": False, "use_zip64": True})
     header_format = workbook.add_format({"bold": True, "bg_color": "#1F2937", "font_color": "white", "border": 1})
 
-    iterator = iter_csv(source)
-    try:
-        headers = unique_headers([clean_header(value, index) for index, value in enumerate(next(iterator)[:MAX_COLUMNS])])
-    except StopIteration as exc:
-        workbook.close()
-        raise ValueError("CSV file is empty.") from exc
+    iterator = iter_csv(source, encoding, delimiter)
+    next(iterator, None) # Skip header row
 
     stats, counters = new_stats(headers)
     analysis = build_analyzer(headers)
     analysis.bucket_size_rows = estimate_initial_bucket_size(source)
     analysis.summary_mode = source.stat().st_size > 50 * 1024 * 1024 or len(headers) > 500
-    progress(0, f"Detected file type: {analysis.file_type}. Writing Data sheet and analyzing equipment.")
     sheet_index = 1
     rows_on_sheet = 0
     rows_read = 0
@@ -1998,12 +2074,15 @@ def process_xlsx(source: Path, output_dir: Path, progress: Any) -> ProcessResult
 
 
 def process_sqlite(source: Path, output_dir: Path, progress: Any) -> ProcessResult:
+    progress(0, "Detecting CSV delimiter")
+    encoding, delimiter, col_count, headers = detect_csv_properties(source)
+    progress(0, "Parsing CSV columns", delimiter=delimiter, columns=col_count)
+    progress(0, "Writing Data sheet")
+
     output_path = output_dir / f"{source.stem}.sqlite"
-    iterator = iter_csv(source)
-    try:
-        headers = unique_headers([clean_header(value, index) for index, value in enumerate(next(iterator)[:MAX_COLUMNS])])
-    except StopIteration as exc:
-        raise ValueError("CSV file is empty.") from exc
+    iterator = iter_csv(source, encoding, delimiter)
+    next(iterator, None) # Skip header row
+
     stats, counters = new_stats(headers)
     column_names = unique_sql_names(headers)
     table = "trend_data"
@@ -2045,12 +2124,15 @@ def process_parquet(source: Path, output_dir: Path, progress: Any) -> ProcessRes
     except ImportError as exc:
         raise RuntimeError("Parquet output requires pyarrow on the backend. Install backend requirements with pyarrow enabled.") from exc
 
+    progress(0, "Detecting CSV delimiter")
+    encoding, delimiter, col_count, headers = detect_csv_properties(source)
+    progress(0, "Parsing CSV columns", delimiter=delimiter, columns=col_count)
+    progress(0, "Writing Data sheet")
+
     output_path = output_dir / f"{source.stem}.parquet"
-    iterator = iter_csv(source)
-    try:
-        headers = unique_headers([clean_header(value, index) for index, value in enumerate(next(iterator)[:MAX_COLUMNS])])
-    except StopIteration as exc:
-        raise ValueError("CSV file is empty.") from exc
+    iterator = iter_csv(source, encoding, delimiter)
+    next(iterator, None) # Skip header row
+
     stats, counters = new_stats(headers)
     writer: pq.ParquetWriter | None = None
     rows_read = 0
