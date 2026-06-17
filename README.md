@@ -17,6 +17,10 @@ The backend streams upload chunks to disk, then streams CSV rows from disk into 
 
 For large files, embedded charts do not use every raw row. The backend creates hidden `_ChartHelper` aggregate data and caps chart points so Excel files remain practical to open.
 
+Jobs are persisted under `backend/tmp/jobs/{job_id}.json`, uploads under `backend/tmp/uploads`, and downloadable ZIP files under `backend/tmp/outputs/{job_id}.zip`. If the backend restarts during processing, the status endpoint returns a clear failed/interrupted message instead of losing the job.
+
+Files over `50MB`, files with more than `500` detected columns, or jobs that pass `50,000` processed rows switch to Summary Mode. Summary Mode keeps the Analysis worksheet compact and avoids expensive deep row-by-row diagnostics.
+
 ## Output
 
 - XLSX output with automatic `Data_N` sheet splitting at Excel's 1,048,576 row limit

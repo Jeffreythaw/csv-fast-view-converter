@@ -11,7 +11,7 @@ import {
 } from 'lucide-react';
 
 type OutputFormat = 'xlsx' | 'sqlite' | 'parquet';
-type JobStatus = 'queued' | 'uploading' | 'processing' | 'completed' | 'failed';
+type JobStatus = 'queued' | 'uploading' | 'processing' | 'completed' | 'failed' | 'expired';
 
 interface QueueFile {
   id: string;
@@ -21,6 +21,7 @@ interface QueueFile {
   jobId?: string;
   rowsProcessed?: number;
   message?: string;
+  currentStep?: string;
   error?: string;
   downloadUrl?: string;
   downloadStatus?: string;
@@ -33,11 +34,13 @@ interface QueueFile {
 
 interface BackendJob {
   id: string;
+  job_id?: string;
   status: JobStatus;
   output_format: OutputFormat;
   uploaded_bytes: number;
   total_bytes?: number;
   rows_processed: number;
+  current_step?: string;
   message: string;
   error?: string;
   download_url?: string;
@@ -67,7 +70,7 @@ function makeQueueItem(file: File): QueueFile {
 
 function statusTone(status: QueueFile['status']) {
   if (status === 'completed') return 'bg-emerald-50 text-emerald-700';
-  if (status === 'failed') return 'bg-rose-50 text-rose-700';
+  if (status === 'failed' || status === 'expired') return 'bg-rose-50 text-rose-700';
   if (status === 'processing' || status === 'uploading' || status === 'queued') return 'bg-blue-50 text-blue-700';
   return 'bg-slate-100 text-slate-600';
 }
@@ -75,10 +78,14 @@ function statusTone(status: QueueFile['status']) {
 async function pollJob(jobId: string, onUpdate: (job: BackendJob) => void): Promise<BackendJob> {
   while (true) {
     const response = await fetch(`${API_BASE}/api/jobs/${jobId}`);
-    if (!response.ok) throw new Error(await response.text());
+    if (!response.ok) {
+      const text = await response.text();
+      if (response.status === 404) throw new Error(`Job expired or backend restarted. Please retry. ${text}`);
+      throw new Error(text);
+    }
     const job = await response.json() as BackendJob;
     onUpdate(job);
-    if (job.status === 'completed' || job.status === 'failed') return job;
+    if (job.status === 'completed' || job.status === 'failed' || job.status === 'expired') return job;
     await new Promise(resolve => window.setTimeout(resolve, POLL_MS));
   }
 }
@@ -228,6 +235,7 @@ export default function App() {
           jobId: created.id,
           status: created.status,
           message: created.message,
+          currentStep: created.current_step,
           rowsProcessed: created.rows_processed,
           outputReady: created.output_ready,
           outputExists: created.output_exists,
@@ -241,6 +249,7 @@ export default function App() {
           updateFile(item.id, {
             status: job.status,
             message: job.message,
+            currentStep: job.current_step,
             rowsProcessed: job.rows_processed,
             error: job.error,
             outputReady: job.output_ready,
@@ -250,8 +259,8 @@ export default function App() {
           });
         });
 
-        if (finalJob.status === 'failed') {
-          throw new Error(finalJob.error || 'Backend conversion failed.');
+        if (finalJob.status === 'failed' || finalJob.status === 'expired') {
+          throw new Error(finalJob.error || (finalJob.status === 'expired' ? 'Job expired or backend restarted. Please retry.' : 'Backend conversion failed.'));
         }
         if (!finalJob.output_ready) {
           throw new Error(`Backend marked the job completed, but the output ZIP is not ready. exists=${finalJob.output_exists}, size=${finalJob.output_size}`);
@@ -356,6 +365,7 @@ export default function App() {
                             {item.message || 'Ready.'}
                             {item.rowsProcessed ? ` ${item.rowsProcessed.toLocaleString()} rows processed.` : ''}
                           </p>
+                          {item.currentStep && <p className="mt-1 text-xs text-slate-500">Step: {item.currentStep}</p>}
                           {item.startedAt && (
                             <p className="mt-1 text-xs text-slate-500">
                               Elapsed: {Math.max(0, Math.round(((item.finishedAt || Date.now()) - item.startedAt) / 1000)).toLocaleString()} sec

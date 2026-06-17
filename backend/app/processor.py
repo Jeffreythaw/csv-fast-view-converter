@@ -250,6 +250,9 @@ class EquipmentState:
     starts: int = 0
     stops: int = 0
     short_cycles: int = 0
+    total_on_minutes: float = 0.0
+    first_start: datetime | None = None
+    last_stop: datetime | None = None
 
 
 @dataclass
@@ -286,6 +289,7 @@ class TrendAnalysis:
     chart_status_columns: list[int] = None  # type: ignore[assignment]
     chart_buckets: list[ChartBucket] = None  # type: ignore[assignment]
     bucket_size_rows: int = 1
+    summary_mode: bool = False
 
     def __post_init__(self) -> None:
         self.interval_seconds = Counter()
@@ -1142,8 +1146,15 @@ def close_active_period(analysis: TrendAnalysis, index: int, end_time: datetime 
     meta = analysis.metas[index]
     state = analysis.equipment.get(meta.equipment)
     if state:
-        state.periods.append(period)
         duration = period_duration_minutes(period)
+        if period.state == 1:
+            state.total_on_minutes += duration
+            if period.start_time and (state.first_start is None or period.start_time < state.first_start):
+                state.first_start = period.start_time
+            if period.end_time and (state.last_stop is None or period.end_time > state.last_stop):
+                state.last_stop = period.end_time
+        if not analysis.summary_mode or len(state.periods) < 200:
+            state.periods.append(period)
         if duration and duration < SHORT_CYCLE_MINUTES and meta.metric in {"run_status", "status", "valve_open_status"}:
             state.short_cycles += 1
 
@@ -1193,18 +1204,22 @@ def update_analysis(analysis: TrendAnalysis, row: list[str]) -> None:
                     equipment_state.starts += 1
                 analysis.active_periods[meta.index] = StatePeriod(meta.equipment, meta.name, timestamp, None, analysis.rows_read, analysis.rows_read, state)
                 if meta.is_alarm:
-                    analysis.events.append(EventRecord(timestamp, meta.equipment, meta.metric, meta.name, "High", f"{meta.name} became active."))
-                    if meta.equipment_type == "Chiller" and meta.metric in {"trip", "lockout", "fail", "overload_trip"}:
+                    if len(analysis.events) < 500:
+                        analysis.events.append(EventRecord(timestamp, meta.equipment, meta.metric, meta.name, "High", f"{meta.name} became active."))
+                    if not analysis.summary_mode and meta.equipment_type == "Chiller" and meta.metric in {"trip", "lockout", "fail", "overload_trip"}:
                         add_chiller_trip_context(analysis, row, timestamp, meta.equipment)
             else:
                 if meta.metric in {"run_status", "status", "valve_open_status"} and equipment_state:
                     equipment_state.stops += 1
                 close_active_period(analysis, meta.index, timestamp, analysis.rows_read)
 
-    if analysis.file_type in {"chiller", "mixed ACMV"}:
+    if analysis.rows_read > 50_000:
+        analysis.summary_mode = True
+    if not analysis.summary_mode and analysis.file_type in {"chiller", "mixed ACMV"}:
         update_chiller_load_analysis(analysis, row, timestamp)
     update_chart_bucket(analysis, row, timestamp)
-    evaluate_equipment_rules(analysis, row, timestamp)
+    if not analysis.summary_mode:
+        evaluate_equipment_rules(analysis, row, timestamp)
 
 
 def finalize_analysis(analysis: TrendAnalysis) -> TrendAnalysis:
@@ -1244,7 +1259,7 @@ def period_duration_minutes(period: StatePeriod) -> float:
 
 
 def equipment_on_minutes(state: EquipmentState) -> float:
-    return sum(period_duration_minutes(period) for period in state.periods if period.state == 1)
+    return state.total_on_minutes or sum(period_duration_minutes(period) for period in state.periods if period.state == 1)
 
 
 def equipment_longest_run_minutes(state: EquipmentState) -> float:
@@ -1613,6 +1628,7 @@ def write_analysis_sheet(workbook: Any, source: Path, rows_read: int, rows_writt
         ("Sampling interval estimate", format_duration((analysis.interval_seconds.most_common(1)[0][0] / 60) if analysis.interval_seconds else 0)),
         ("Detected file type", analysis.file_type),
         ("Detected equipment count", len([state for state in analysis.equipment.values() if state.equipment != "Unknown Equipment"])),
+        ("Analysis mode", "Summary Mode" if analysis.summary_mode else "Detailed Mode"),
         ("Detected systems", ", ".join(systems[:12]) if systems else "Unknown"),
         ("Output", output_kind),
         ("Excel sheet split", "Automatic at 1,048,576 rows per sheet"),
@@ -1670,8 +1686,8 @@ def write_analysis_sheet(workbook: Any, source: Path, rows_read: int, rows_writt
         if not state.status_columns and not state.periods:
             continue
         periods = [period for period in state.periods if period.state == 1]
-        first_start = min((period.start_time for period in periods if period.start_time), default=None)
-        last_stop = max((period.end_time for period in periods if period.end_time), default=None)
+        first_start = state.first_start or min((period.start_time for period in periods if period.start_time), default=None)
+        last_stop = state.last_stop or max((period.end_time for period in periods if period.end_time), default=None)
         on_minutes = equipment_on_minutes(state)
         comment = "Review short cycling." if state.short_cycles else ("Operation detected." if on_minutes else "No ON period detected.")
         write_table_row(
@@ -1933,6 +1949,7 @@ def process_xlsx(source: Path, output_dir: Path, progress: Any) -> ProcessResult
     stats, counters = new_stats(headers)
     analysis = build_analyzer(headers)
     analysis.bucket_size_rows = estimate_initial_bucket_size(source)
+    analysis.summary_mode = source.stat().st_size > 50 * 1024 * 1024 or len(headers) > 500
     progress(0, f"Detected file type: {analysis.file_type}. Writing Data sheet and analyzing equipment.")
     sheet_index = 1
     rows_on_sheet = 0

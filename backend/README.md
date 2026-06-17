@@ -27,6 +27,10 @@ pip install -r requirements-parquet.txt
 
 Temporary uploads and outputs are kept under `backend/tmp` and cleaned after the configured TTL.
 
+Job metadata is persisted in `backend/tmp/jobs/{job_id}.json`, and final ZIP output is moved to `backend/tmp/outputs/{job_id}.zip`. Completed and failed jobs are kept for 6 hours by default. Active processing jobs are not cleaned up.
+
+If the backend restarts while a job is queued or processing, `GET /api/jobs/{job_id}` marks it failed with: `Job interrupted or backend restarted during processing. Please retry.`
+
 ## Download Checks
 
 `GET /api/jobs/{job_id}` returns output debug fields:
