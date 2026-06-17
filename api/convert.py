@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
-from flask import Flask, Response, request
+from flask import Flask, Response, jsonify, request
 
 
 app = Flask(__name__)
@@ -69,6 +69,20 @@ PREFERRED_NUMERIC_CATEGORIES = {
 
 ACTIVE_STATUS_VALUES = {"alarm", "trip", "fault", "lockout", "fail", "failure", "warning", "on", "true", "run", "running", "open", "start", "enabled", "1"}
 MAX_VERCEL_BODY_BYTES = int(4.5 * 1024 * 1024)
+LOCAL_SERVER_DEFAULT_PORT = 8765
+
+
+@app.after_request
+def add_local_cors_headers(response: Response) -> Response:
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    response.headers["Access-Control-Allow-Private-Network"] = "true"
+    return response
+
+
+def options_response() -> Response:
+    return Response(status=204)
 
 
 def detect_delimiter(raw: bytes) -> str:
@@ -605,6 +619,73 @@ def convert_local_files(input_paths: list[Path], output_zip: Path) -> tuple[int,
     return success_count, fail_count
 
 
+def resolve_local_csv_paths(values: list[str]) -> list[Path]:
+    paths: list[Path] = []
+    seen: set[Path] = set()
+    for value in values:
+        text = value.strip().strip('"').strip("'")
+        if not text:
+            continue
+        path = Path(text).expanduser()
+        candidates: list[Path]
+        if path.is_dir():
+            candidates = sorted(item for item in path.iterdir() if item.is_file() and item.suffix.lower() == ".csv")
+        else:
+            candidates = [path]
+
+        for candidate in candidates:
+            resolved = candidate.resolve() if candidate.exists() else candidate
+            if resolved not in seen:
+                seen.add(resolved)
+                paths.append(resolved)
+    return paths
+
+
+@app.route("/api/local/status", methods=["GET", "OPTIONS"])
+def local_status() -> Response:
+    if request.method == "OPTIONS":
+        return options_response()
+    return jsonify({
+        "ok": True,
+        "service": "HBL-BMS Trending Local Converter",
+        "time": datetime.now(UTC).isoformat(timespec="seconds"),
+    })
+
+
+@app.route("/api/local/convert", methods=["POST", "OPTIONS"])
+def local_convert() -> Response:
+    if request.method == "OPTIONS":
+        return options_response()
+
+    payload = request.get_json(silent=True) or {}
+    raw_paths = payload.get("paths") or []
+    if isinstance(raw_paths, str):
+        raw_paths = [line for line in raw_paths.splitlines() if line.strip()]
+    if not isinstance(raw_paths, list):
+        return jsonify({"ok": False, "error": "paths must be a list of CSV file paths or folder paths."}), 400
+
+    input_paths = resolve_local_csv_paths([str(value) for value in raw_paths])
+    if not input_paths:
+        return jsonify({"ok": False, "error": "No CSV files found. Paste a CSV file path or a folder containing CSV files."}), 400
+
+    output_dir_value = str(payload.get("outputDir") or "").strip().strip('"').strip("'")
+    output_dir = Path(output_dir_value).expanduser() if output_dir_value else input_paths[0].parent
+    output_zip = output_dir / "hbl-bms-trend-analysis.zip"
+
+    try:
+        success_count, fail_count = convert_local_files(input_paths, output_zip)
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+    return jsonify({
+        "ok": success_count > 0,
+        "outputZip": str(output_zip.resolve()),
+        "successfulFiles": success_count,
+        "failedFiles": fail_count,
+        "inputFiles": [str(path) for path in input_paths],
+    })
+
+
 @app.post("/api/convert")
 @app.post("/")
 def convert() -> Response:
@@ -657,11 +738,23 @@ def convert() -> Response:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Convert local BMS / ACMV trend CSV files to analyzed Excel workbooks.")
-    parser.add_argument("inputs", nargs="+", help="CSV file paths to convert locally.")
+    parser.add_argument("inputs", nargs="*", help="CSV file paths or folder paths to convert locally.")
     parser.add_argument("--out", default="hbl-bms-trend-analysis.zip", help="Output ZIP path.")
+    parser.add_argument("--serve-local", action="store_true", help="Run the local companion API for the web UI.")
+    parser.add_argument("--host", default="127.0.0.1", help="Local companion API host.")
+    parser.add_argument("--port", type=int, default=LOCAL_SERVER_DEFAULT_PORT, help="Local companion API port.")
     args = parser.parse_args()
 
-    success_count, fail_count = convert_local_files([Path(path) for path in args.inputs], Path(args.out))
+    if args.serve_local:
+        print(f"HBL-BMS Trending local companion API running at http://{args.host}:{args.port}")
+        app.run(host=args.host, port=args.port, debug=False)
+        return 0
+
+    input_paths = resolve_local_csv_paths(args.inputs)
+    if not input_paths:
+        parser.error("Provide at least one CSV file path or folder path, or use --serve-local.")
+
+    success_count, fail_count = convert_local_files(input_paths, Path(args.out))
     print(f"Done. Successful files: {success_count}. Failed files: {fail_count}.")
     print(f"Output: {Path(args.out).resolve()}")
     return 0 if success_count > 0 else 1
