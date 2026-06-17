@@ -70,6 +70,9 @@ PREFERRED_NUMERIC_CATEGORIES = {
 ACTIVE_STATUS_VALUES = {"alarm", "trip", "fault", "lockout", "fail", "failure", "warning", "on", "true", "run", "running", "open", "start", "enabled", "1"}
 MAX_VERCEL_BODY_BYTES = int(4.5 * 1024 * 1024)
 LOCAL_SERVER_DEFAULT_PORT = 8765
+EXCEL_MAX_ROWS = 1_048_576
+EXCEL_MAX_COLUMNS = 16_384
+EXCEL_MAX_DATA_ROWS = EXCEL_MAX_ROWS - 1
 
 
 @app.after_request
@@ -326,18 +329,19 @@ def clean_sheet_name(name: str) -> str:
 
 def write_data_sheet(workbook: Any, df: pd.DataFrame) -> Any:
     worksheet = workbook.add_worksheet("Data")
+    sheet_df = df.iloc[:EXCEL_MAX_DATA_ROWS, :EXCEL_MAX_COLUMNS]
     header_fmt = workbook.add_format({"bold": True, "bg_color": "#1F2937", "font_color": "white", "text_wrap": True, "valign": "vcenter", "border": 1})
     text_fmt = workbook.add_format({"valign": "top", "border": 0})
     date_fmt = workbook.add_format({"num_format": "yyyy-mm-dd hh:mm", "valign": "top"})
     number_fmt = workbook.add_format({"num_format": "#,##0.00", "valign": "top"})
 
-    for col_idx, col in enumerate(df.columns):
+    for col_idx, col in enumerate(sheet_df.columns):
         worksheet.write(0, col_idx, col, header_fmt)
-        sample = df[col].astype(str).head(100).tolist()
+        sample = sheet_df[col].astype(str).head(100).tolist()
         width = min(max(len(str(col)) + 2, *(len(value) + 1 for value in sample)), 32)
         worksheet.set_column(col_idx, col_idx, width)
 
-    for row_idx, row in enumerate(df.itertuples(index=False), start=1):
+    for row_idx, row in enumerate(sheet_df.itertuples(index=False), start=1):
         for col_idx, value in enumerate(row):
             if pd.isna(value):
                 worksheet.write_blank(row_idx, col_idx, None, text_fmt)
@@ -351,7 +355,7 @@ def write_data_sheet(workbook: Any, df: pd.DataFrame) -> Any:
                 worksheet.write(row_idx, col_idx, str(value), text_fmt)
 
     worksheet.freeze_panes(1, 0)
-    worksheet.autofilter(0, 0, max(len(df), 1), max(len(df.columns) - 1, 0))
+    worksheet.autofilter(0, 0, max(len(sheet_df), 1), max(len(sheet_df.columns) - 1, 0))
     return worksheet
 
 
@@ -445,6 +449,8 @@ def write_analysis_sheet(
         ("File", file_name),
         ("Rows", len(df)),
         ("Columns", len(df.columns)),
+        ("Data sheet rows written", min(len(df), EXCEL_MAX_DATA_ROWS)),
+        ("Data sheet columns written", min(len(df.columns), EXCEL_MAX_COLUMNS)),
         ("Date/time column", datetime_col or "Not detected"),
         ("Detected systems", ", ".join(equipment) if equipment else "No strong equipment keyword detected"),
     ]
@@ -557,6 +563,8 @@ def create_excel_with_analysis(uploaded_file: Any) -> bytes:
     status_cols = select_status_columns(df, categories)
     status_rows = status_profile(df, status_cols)
     insights = build_insights(df, datetime_col, numeric_rows, selected_numeric, status_rows)
+    if len(df) > EXCEL_MAX_DATA_ROWS or len(df.columns) > EXCEL_MAX_COLUMNS:
+        insights.append("Data sheet was capped at Excel's worksheet row/column limit. Analysis calculations used the loaded CSV data.")
     helper_rows, helper_refs = build_helper_data(df, datetime_col, selected_numeric, numeric_rows, status_rows)
 
     output = io.BytesIO()
