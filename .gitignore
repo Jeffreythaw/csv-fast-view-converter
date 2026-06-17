@@ -1,7 +1,9 @@
 node_modules/
 .venv/
 __pycache__/
+**/__pycache__/
 *.pyc
+backend/tmp/
 build/
 dist/
 coverage/
