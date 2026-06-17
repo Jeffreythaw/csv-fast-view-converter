@@ -94,6 +94,7 @@ class ColumnMeta:
     name: str
     index: int
     equipment: str
+    equipment_type: str
     metric: str
     is_discrete: bool
     is_alarm: bool
@@ -160,6 +161,7 @@ class AnalogRecord:
 @dataclass
 class EquipmentState:
     equipment: str
+    equipment_type: str
     columns: list[str]
     command_columns: list[int]
     status_columns: list[int]
@@ -187,6 +189,7 @@ class TrendAnalysis:
     headers: list[str]
     metas: list[ColumnMeta]
     datetime_index: int | None
+    file_type: str = "unknown"
     rows_read: int = 0
     first_timestamp: datetime | None = None
     last_timestamp: datetime | None = None
@@ -219,12 +222,12 @@ class TrendAnalysis:
         for meta in self.metas:
             state = self.equipment.setdefault(
                 meta.equipment,
-                EquipmentState(meta.equipment, [], [], [], [], [], [], [], []),
+                EquipmentState(meta.equipment, meta.equipment_type, [], [], [], [], [], [], [], []),
             )
             state.columns.append(meta.name)
             if meta.metric == "command":
                 state.command_columns.append(meta.index)
-            if meta.metric in {"run_status", "status", "valve_open_status", "valve_close_status"}:
+            if meta.metric in {"run_status", "status", "valve_open_status", "valve_close_status", "valve_feedback"}:
                 state.status_columns.append(meta.index)
             if meta.is_alarm:
                 state.alarm_columns.append(meta.index)
@@ -290,7 +293,7 @@ def classify_column(header: str) -> str:
     return "unknown"
 
 
-def parse_equipment_and_metric(header: str) -> tuple[str, str]:
+def parse_equipment_and_metric(header: str) -> tuple[str, str, str]:
     text = compact_name(header)
     normalized = f" {text} "
     number_match = re.search(r"\b(?:no|unit|cell)?\s*([0-9]+(?:[-_][0-9]+)?)\b", text)
@@ -298,28 +301,52 @@ def parse_equipment_and_metric(header: str) -> tuple[str, str]:
 
     if any(token in normalized for token in [" chilled water pump ", " chw pump ", " chwp "]):
         equipment = f"CHWP{suffix}".strip()
+        equipment_type = "CHWP"
     elif any(token in normalized for token in [" condenser water pump ", " cdw pump ", " cwp ", " cdwp "]):
         equipment = f"CDWP{suffix}".strip()
+        equipment_type = "CDWP"
     elif any(token in normalized for token in [" cooling tower ", " ct fan ", " ct cell ", " tower cell "]):
         equipment = f"Cooling Tower{suffix}".strip()
+        equipment_type = "Cooling Tower"
     elif " chiller " in normalized or re.search(r"\bch(?:iller)?\s*[0-9]\b", text):
         equipment = f"Chiller{suffix}".strip()
+        equipment_type = "Chiller"
     elif " ahu " in normalized or " air handling unit " in normalized:
         equipment = f"AHU{suffix}".strip()
+        equipment_type = "AHU"
     elif " fcu " in normalized or " fan coil " in normalized:
         equipment = f"FCU{suffix}".strip()
+        equipment_type = "FCU"
     elif " mcc " in normalized or " power meter " in normalized or " incoming " in normalized:
         equipment = f"MCC / Power Meter{suffix}".strip()
+        equipment_type = "Power Meter"
+    elif " vsd " in normalized or " vfd " in normalized:
+        equipment = f"VSD{suffix}".strip()
+        equipment_type = "VSD"
     elif " valve " in normalized or " vlv " in normalized:
         equipment = f"Valve{suffix}".strip()
+        equipment_type = "Valve"
     elif " fan " in normalized or " blower " in normalized:
         equipment = f"Fan{suffix}".strip()
+        equipment_type = "Fan"
     elif " pump " in normalized:
         equipment = f"Pump{suffix}".strip()
+        equipment_type = "Pump"
     else:
         equipment = "Unknown Equipment"
+        equipment_type = "Unknown"
 
-    if any(token in normalized for token in [" lockout ", " locked out "]):
+    if " smoke " in normalized and " detector " in normalized:
+        metric = "smoke_detector"
+    elif " water leak " in normalized or " leak alarm " in normalized:
+        metric = "water_leak"
+    elif " filter dirty " in normalized or " dirty filter " in normalized:
+        metric = "filter_dirty"
+    elif " overload " in normalized:
+        metric = "overload_trip"
+    elif " general fault " in normalized:
+        metric = "general_fault"
+    elif any(token in normalized for token in [" lockout ", " locked out "]):
         metric = "lockout"
     elif any(token in normalized for token in [" trip ", " tripped "]):
         metric = "trip"
@@ -329,15 +356,23 @@ def parse_equipment_and_metric(header: str) -> tuple[str, str]:
         metric = "alarm"
     elif any(token in normalized for token in [" available ", " availability "]):
         metric = "available"
+    elif " override " in normalized and any(token in normalized for token in [" enable ", " enabled ", " active "]):
+        metric = "override_enable"
+    elif " override " in normalized:
+        metric = "override_value"
     elif any(token in normalized for token in [" maintenance ", " maint "]) or " hand " in normalized:
         metric = "maintenance_mode"
     elif " auto " in normalized or " manual " in normalized or " switch " in normalized:
         metric = "switch_mode"
     elif any(token in normalized for token in [" command ", " cmd ", " enable ", " start cmd ", " stop cmd "]):
         metric = "command"
-    elif (" vsd " in normalized or " vfd " in normalized) and any(token in normalized for token in [" feedback ", " fb ", " speed ", " hz ", " frequency "]):
+    elif (" valve " in normalized or " vlv " in normalized or " damper " in normalized) and any(token in normalized for token in [" feedback ", " fb ", " position "]):
+        metric = "valve_feedback"
+    elif (" valve " in normalized or " vlv " in normalized or " damper " in normalized) and any(token in normalized for token in [" command ", " cmd ", " control "]):
+        metric = "valve_command"
+    elif (" vsd " in normalized or " vfd " in normalized or " fan vsd " in normalized) and any(token in normalized for token in [" feedback ", " fb ", " speed ", " hz ", " frequency "]):
         metric = "vsd_feedback"
-    elif (" vsd " in normalized or " vfd " in normalized) and any(token in normalized for token in [" command ", " cmd ", " reference "]):
+    elif (" vsd " in normalized or " vfd " in normalized or " fan vsd " in normalized) and any(token in normalized for token in [" command ", " cmd ", " reference ", " control "]):
         metric = "vsd_command"
     elif " runtime " in normalized or " run hour " in normalized:
         metric = "runtime"
@@ -365,11 +400,13 @@ def parse_equipment_and_metric(header: str) -> tuple[str, str]:
         metric = "flow"
     elif any(token in normalized for token in [" humidity ", " rh "]):
         metric = "humidity"
+    elif " co2 " in normalized or " carbon dioxide " in normalized:
+        metric = "co2"
     elif " setpoint " in normalized or " set point " in normalized or " sp " in normalized:
         metric = "setpoint"
     else:
         metric = "unknown"
-    return equipment, metric
+    return equipment, equipment_type, metric
 
 
 def is_discrete_metric(metric: str) -> bool:
@@ -381,20 +418,26 @@ def is_discrete_metric(metric: str) -> bool:
         "alarm",
         "fail",
         "lockout",
+        "overload_trip",
+        "filter_dirty",
+        "smoke_detector",
+        "water_leak",
+        "general_fault",
         "available",
         "maintenance_mode",
         "switch_mode",
+        "override_enable",
         "valve_open_status",
         "valve_close_status",
     }
 
 
 def is_alarm_metric(metric: str) -> bool:
-    return metric in {"trip", "alarm", "fail", "lockout"}
+    return metric in {"trip", "alarm", "fail", "lockout", "overload_trip", "filter_dirty", "smoke_detector", "water_leak", "general_fault"}
 
 
 def is_meaningful_analog(metric: str) -> bool:
-    return metric in {"active_power", "current", "vsd_feedback", "temperature", "pressure", "flow", "humidity"}
+    return metric in {"active_power", "current", "frequency", "vsd_feedback", "vsd_command", "valve_command", "valve_feedback", "temperature", "pressure", "flow", "humidity", "co2", "setpoint"}
 
 
 def analog_near_zero_threshold(metric: str) -> float:
@@ -406,12 +449,13 @@ def analog_near_zero_threshold(metric: str) -> float:
 def classify_columns(headers: list[str]) -> list[ColumnMeta]:
     metas: list[ColumnMeta] = []
     for index, header in enumerate(headers):
-        equipment, metric = parse_equipment_and_metric(header)
+        equipment, equipment_type, metric = parse_equipment_and_metric(header)
         metas.append(
             ColumnMeta(
                 name=header,
                 index=index,
                 equipment=equipment,
+                equipment_type=equipment_type,
                 metric=metric,
                 is_discrete=is_discrete_metric(metric),
                 is_alarm=is_alarm_metric(metric),
@@ -582,7 +626,27 @@ def select_chart_status_columns(metas: list[ColumnMeta]) -> list[int]:
 
 def build_analyzer(headers: list[str]) -> TrendAnalysis:
     metas = classify_columns(headers)
-    return TrendAnalysis(headers=headers, metas=metas, datetime_index=detect_datetime_index(headers))
+    return TrendAnalysis(headers=headers, metas=metas, datetime_index=detect_datetime_index(headers), file_type=detect_file_type(metas))
+
+
+def detect_file_type(metas: list[ColumnMeta]) -> str:
+    types = Counter(meta.equipment_type for meta in metas)
+    has_chiller = types["Chiller"] > 0
+    has_ahu = types["AHU"] > 0
+    has_fcu = types["FCU"] > 0
+    has_ct_pump_vsd = types["Cooling Tower"] > 0 or types["CHWP"] > 0 or types["CDWP"] > 0 or types["Pump"] > 0 or types["VSD"] > 0
+    detected = sum([has_chiller, has_ahu, has_fcu, has_ct_pump_vsd])
+    if detected > 1:
+        return "mixed ACMV"
+    if has_chiller:
+        return "chiller"
+    if has_ahu:
+        return "AHU"
+    if has_fcu:
+        return "FCU"
+    if has_ct_pump_vsd:
+        return "CT / CHWP / CDWP / VSD"
+    return "unknown"
 
 
 def estimate_bucket_size(rows_read: int) -> int:
@@ -630,6 +694,28 @@ def set_mismatch(analysis: TrendAnalysis, key: str, active: bool, event_factory:
         analysis.events.append(event_factory())
 
 
+def values_for_metrics(analysis: TrendAnalysis, row: list[str], equipment: str, metrics: set[str]) -> list[float]:
+    values: list[float] = []
+    for meta in analysis.metas:
+        if meta.equipment != equipment or meta.metric not in metrics or meta.index >= len(row):
+            continue
+        number = parse_number(row[meta.index])
+        if number is not None:
+            values.append(number)
+    return values
+
+
+def states_for_metrics(analysis: TrendAnalysis, row: list[str], equipment: str, metrics: set[str]) -> list[int]:
+    states: list[int] = []
+    for meta in analysis.metas:
+        if meta.equipment != equipment or meta.metric not in metrics or meta.index >= len(row):
+            continue
+        state = parse_state(row[meta.index])
+        if state is not None:
+            states.append(state)
+    return states
+
+
 def evaluate_equipment_rules(analysis: TrendAnalysis, row: list[str], timestamp: datetime | None) -> None:
     for state in analysis.equipment.values():
         command_states = [parse_state(row[index]) for index in state.command_columns if index < len(row)]
@@ -637,9 +723,18 @@ def evaluate_equipment_rules(analysis: TrendAnalysis, row: list[str], timestamp:
         analog_values = [
             parse_number(row[index])
             for index in state.analog_columns
-            if index < len(row) and analysis.metas[index].metric in {"active_power", "current", "vsd_feedback", "flow"}
+            if index < len(row) and analysis.metas[index].metric in {"active_power", "current", "vsd_feedback", "frequency", "flow"}
         ]
         analog_values = [value for value in analog_values if value is not None]
+        valve_commands = values_for_metrics(analysis, row, state.equipment, {"valve_command"})
+        valve_feedbacks = values_for_metrics(analysis, row, state.equipment, {"valve_feedback"})
+        vsd_commands = values_for_metrics(analysis, row, state.equipment, {"vsd_command"})
+        vsd_feedbacks = values_for_metrics(analysis, row, state.equipment, {"vsd_feedback"})
+        temperatures = values_for_metrics(analysis, row, state.equipment, {"temperature"})
+        setpoints = values_for_metrics(analysis, row, state.equipment, {"setpoint"})
+        humidity = values_for_metrics(analysis, row, state.equipment, {"humidity"})
+        co2 = values_for_metrics(analysis, row, state.equipment, {"co2"})
+        overrides = states_for_metrics(analysis, row, state.equipment, {"override_enable"})
 
         command_on = any(value == 1 for value in command_states)
         status_on = any(value == 1 for value in status_states)
@@ -658,6 +753,99 @@ def evaluate_equipment_rules(analysis: TrendAnalysis, row: list[str], timestamp:
                 "command/status",
                 "Warning",
                 f"Command appears ON but status remains OFF for about {COMMAND_RESPONSE_DELAY_MINUTES} minutes.",
+            ),
+        )
+        set_mismatch(
+            analysis,
+            f"{state.equipment}:valve_command_high_feedback_low",
+            bool(valve_commands and valve_feedbacks and max(valve_commands) >= 50 and max(valve_feedbacks) < 20),
+            lambda state=state, timestamp=timestamp: EventRecord(
+                timestamp,
+                state.equipment,
+                "valve_command_feedback_mismatch",
+                "valve command/feedback",
+                "Warning",
+                "Valve command is high while valve feedback remains low.",
+            ),
+        )
+        set_mismatch(
+            analysis,
+            f"{state.equipment}:valve_feedback_high_command_low",
+            bool(valve_commands and valve_feedbacks and max(valve_commands) <= 5 and max(valve_feedbacks) >= 30),
+            lambda state=state, timestamp=timestamp: EventRecord(
+                timestamp,
+                state.equipment,
+                "valve_feedback_without_command",
+                "valve command/feedback",
+                "Warning",
+                "Valve feedback is high while command is near zero; check stuck valve or mapping.",
+            ),
+        )
+        set_mismatch(
+            analysis,
+            f"{state.equipment}:vsd_command_feedback_mismatch",
+            bool(vsd_commands and vsd_feedbacks and max(vsd_commands) >= 30 and max(vsd_feedbacks) < 5),
+            lambda state=state, timestamp=timestamp: EventRecord(
+                timestamp,
+                state.equipment,
+                "vsd_command_feedback_mismatch",
+                "VSD command/feedback",
+                "Warning",
+                "VSD command is present but VSD feedback remains near zero.",
+            ),
+        )
+        set_mismatch(
+            analysis,
+            f"{state.equipment}:override_enabled",
+            any(value == 1 for value in overrides),
+            lambda state=state, timestamp=timestamp: EventRecord(
+                timestamp,
+                state.equipment,
+                "override_enabled",
+                "override point",
+                "Info",
+                "Override enable point is active; automatic operation may be bypassed.",
+            ),
+        )
+        if temperatures and setpoints:
+            temp_above_sp = max(temperatures) - min(setpoints)
+            set_mismatch(
+                analysis,
+                f"{state.equipment}:comfort_temp_high",
+                temp_above_sp > 2.0,
+                lambda state=state, timestamp=timestamp, temp_above_sp=temp_above_sp: EventRecord(
+                    timestamp,
+                    state.equipment,
+                    "comfort_temperature_deviation",
+                    "temperature/setpoint",
+                    "Warning",
+                    f"Temperature is about {temp_above_sp:.1f} deg above setpoint.",
+                ),
+            )
+        set_mismatch(
+            analysis,
+            f"{state.equipment}:high_humidity",
+            bool(humidity and max(humidity) > 75),
+            lambda state=state, timestamp=timestamp: EventRecord(
+                timestamp,
+                state.equipment,
+                "high_humidity",
+                "humidity",
+                "Warning",
+                "Humidity is above 75%; review comfort and dehumidification.",
+            ),
+        )
+        set_mismatch(
+            analysis,
+            f"{state.equipment}:high_co2",
+            bool(co2 and max(co2) > 1000),
+            lambda state=state, timestamp=timestamp: EventRecord(
+                timestamp,
+                state.equipment,
+                "high_co2",
+                "CO2",
+                "Warning",
+                "CO2 is above 1000 ppm; review ventilation or sensor mapping.",
             ),
         )
         set_mismatch(
@@ -877,6 +1065,7 @@ def estimate_initial_bucket_size(source: Path) -> int:
 def build_key_findings(analysis: TrendAnalysis) -> list[str]:
     systems = sorted({meta.equipment for meta in analysis.metas if meta.equipment != "Unknown Equipment"})
     findings = []
+    findings.append(f"Detected trend file type: {analysis.file_type}.")
     if systems:
         findings.append(f"Trend contains detected BMS / ACMV equipment groups: {', '.join(systems[:8])}.")
     else:
@@ -901,6 +1090,131 @@ def build_key_findings(analysis: TrendAnalysis) -> list[str]:
         findings.append(f"{len(useful_analogs)} meaningful analog trend(s) were detected for power/current/VSD/temperature/pressure/flow review.")
     findings.append("No final conclusion should be made without verifying BMS point mapping, command logic, and alarm definitions.")
     return findings[:10]
+
+
+def equipment_observation(state: EquipmentState, analysis: TrendAnalysis) -> str:
+    notes: list[str] = []
+    if equipment_on_minutes(state) > 0:
+        notes.append("operation detected")
+    if state.short_cycles:
+        notes.append(f"{state.short_cycles} short cycles")
+    if state.alarm_columns:
+        notes.append("alarm/trip/fault points available")
+    if state.command_columns and not state.status_columns:
+        notes.append("command without clear run proof")
+    if state.status_columns and not state.command_columns:
+        notes.append("status/run proof without command")
+    related_events = [event for event in analysis.events if event.equipment == state.equipment and event.severity in {"High", "Warning"}]
+    if related_events:
+        notes.append(f"{len(related_events)} item(s) require review")
+    return "; ".join(notes) if notes else "No major operation issue detected by generic rules."
+
+
+def event_summary_rows(analysis: TrendAnalysis) -> list[list[Any]]:
+    grouped: dict[tuple[str, str, str], dict[str, Any]] = {}
+    meta_by_name = {meta.name: meta for meta in analysis.metas}
+    for state in analysis.equipment.values():
+        for period in state.periods:
+            meta = meta_by_name.get(period.column)
+            if not meta or not meta.is_alarm:
+                continue
+            key = (period.equipment, meta.metric, period.column)
+            item = grouped.setdefault(
+                key,
+                {"first": period.start_time, "last": period.end_time, "duration": 0.0, "count": 0},
+            )
+            item["count"] += 1
+            item["duration"] += period_duration_minutes(period)
+            if period.start_time and (item["first"] is None or period.start_time < item["first"]):
+                item["first"] = period.start_time
+            if period.end_time and (item["last"] is None or period.end_time > item["last"]):
+                item["last"] = period.end_time
+    rows: list[list[Any]] = []
+    for (equipment, event_type, evidence), item in sorted(grouped.items()):
+        severity = "High" if event_type in {"trip", "lockout", "fail", "overload_trip", "smoke_detector", "water_leak", "general_fault"} else "Warning"
+        rows.append([
+            equipment,
+            event_type,
+            format_dt(item["first"]),
+            format_dt(item["last"]),
+            format_duration(item["duration"]),
+            item["count"],
+            severity,
+            f"{evidence} active for {format_duration(item['duration'])} across {item['count']} occurrence(s).",
+        ])
+    return rows
+
+
+def data_quality_rows(analysis: TrendAnalysis) -> list[list[Any]]:
+    rows: list[list[Any]] = []
+    if analysis.datetime_index is None:
+        rows.append(["Missing timestamps", "No datetime column was confidently detected.", "Warning"])
+    if analysis.data_gaps:
+        rows.append(["Timestamp gaps", f"{analysis.data_gaps} large timestamp gap(s) detected.", "Warning"])
+    if analysis.duplicate_timestamps:
+        rows.append(["Duplicate timestamps", f"{analysis.duplicate_timestamps} duplicate timestamp sample(s) detected.", "Warning"])
+    for analog in analysis.analogs.values():
+        if analog.count >= 10 and analog.std_dev < 0.0001:
+            rows.append(["Constant column", f"{analog.column} is mostly constant.", "Info"])
+        if analog.metric == "temperature" and analog.minimum is not None and (analog.minimum < -20 or analog.maximum and analog.maximum > 80):
+            rows.append(["Suspicious temperature range", f"{analog.column} range looks outside normal ACMV trend limits.", "Warning"])
+    return rows or [["No major data quality issue", "No timestamp gaps, duplicates, or obvious constant analog problems detected by generic rules.", "Info"]]
+
+
+def file_specific_rows(analysis: TrendAnalysis) -> tuple[str, list[str], list[list[Any]]]:
+    if analysis.file_type == "chiller":
+        rows = []
+        for state in analysis.equipment.values():
+            if state.equipment_type != "Chiller":
+                continue
+            trip_events = [event for event in analysis.events if event.equipment == state.equipment and event.issue_type in {"trip", "lockout", "fail"}]
+            chw = [analog for analog in analysis.analogs.values() if analog.equipment == state.equipment and analog.metric == "temperature" and any(token in compact_name(analog.column) for token in ["evap", "chw", "leaving", "entering"])]
+            cdw = [analog for analog in analysis.analogs.values() if analog.equipment == state.equipment and analog.metric == "temperature" and any(token in compact_name(analog.column) for token in ["cond", "cdw", "leaving", "entering"])]
+            classification = "Insufficient data"
+            if trip_events and equipment_on_minutes(state) <= SHORT_CYCLE_MINUTES:
+                classification = "Startup low water-load trip pattern possible"
+            elif trip_events and equipment_on_minutes(state) > SHORT_CYCLE_MINUTES:
+                classification = "Loaded running trip pattern possible"
+            comment = "Use CHW/CDW delta-T and valve proof as primary load evidence; current/VFD are secondary evidence."
+            rows.append([state.equipment, len(trip_events), format_duration(equipment_on_minutes(state)), len(chw), len(cdw), classification, comment])
+        return "Chiller Trip / Water-Side Review", ["Chiller", "Trip events", "Run duration", "CHW temp points", "CDW temp points", "Classification", "Engineering comment"], rows
+    if analysis.file_type == "AHU":
+        return "AHU Comfort / Valve / VSD Review", ["AHU", "Run duration", "Events", "Valve/VSD points", "Comfort points", "Observation"], [
+            [
+                state.equipment,
+                format_duration(equipment_on_minutes(state)),
+                sum(1 for event in analysis.events if event.equipment == state.equipment),
+                len(state.vsd_columns) + len([i for i in state.analog_columns if analysis.metas[i].metric in {"valve_command", "valve_feedback"}]),
+                len([i for i in state.analog_columns if analysis.metas[i].metric in {"temperature", "humidity", "co2", "setpoint"}]),
+                equipment_observation(state, analysis),
+            ]
+            for state in analysis.equipment.values() if state.equipment_type == "AHU"
+        ]
+    if analysis.file_type == "FCU":
+        return "FCU Comfort / Leak / Override Review", ["FCU", "Run duration", "Events", "Valve/VSD points", "Comfort points", "Observation"], [
+            [
+                state.equipment,
+                format_duration(equipment_on_minutes(state)),
+                sum(1 for event in analysis.events if event.equipment == state.equipment),
+                len(state.vsd_columns) + len([i for i in state.analog_columns if analysis.metas[i].metric in {"valve_command", "valve_feedback"}]),
+                len([i for i in state.analog_columns if analysis.metas[i].metric in {"temperature", "setpoint"}]),
+                equipment_observation(state, analysis),
+            ]
+            for state in analysis.equipment.values() if state.equipment_type == "FCU"
+        ]
+    if analysis.file_type in {"CT / CHWP / CDWP / VSD", "mixed ACMV"}:
+        return "CT / Pump / VSD Review", ["Equipment", "Type", "Run duration", "Fault events", "Power/current/frequency points", "Observation"], [
+            [
+                state.equipment,
+                state.equipment_type,
+                format_duration(equipment_on_minutes(state)),
+                sum(1 for event in analysis.events if event.equipment == state.equipment and event.issue_type in {"general_fault", "trip", "fail", "alarm"}),
+                len([i for i in state.analog_columns if analysis.metas[i].metric in {"active_power", "current", "frequency", "vsd_feedback", "vsd_command"}]),
+                equipment_observation(state, analysis),
+            ]
+            for state in analysis.equipment.values() if state.equipment_type in {"Cooling Tower", "CHWP", "CDWP", "Pump", "Fan", "Chiller"}
+        ]
+    return "File-Specific Review", ["Item", "Observation"], [["Unknown file type", "Analyzer could not confidently match this file to chiller, AHU, FCU, or CT/Pump/VSD patterns."]]
 
 
 def write_table_row(worksheet: Any, row: int, values: list[Any], fmt: Any) -> None:
@@ -957,6 +1271,8 @@ def write_analysis_sheet(workbook: Any, source: Path, rows_read: int, rows_writt
         ("Date/time range", f"{format_dt(analysis.first_timestamp)} to {format_dt(analysis.last_timestamp)}"),
         ("Duration", format_duration(trend_duration_minutes(analysis))),
         ("Sampling interval estimate", format_duration((analysis.interval_seconds.most_common(1)[0][0] / 60) if analysis.interval_seconds else 0)),
+        ("Detected file type", analysis.file_type),
+        ("Detected equipment count", len([state for state in analysis.equipment.values() if state.equipment != "Unknown Equipment"])),
         ("Detected systems", ", ".join(systems[:12]) if systems else "Unknown"),
         ("Output", output_kind),
         ("Excel sheet split", "Automatic at 1,048,576 rows per sheet"),
@@ -979,7 +1295,7 @@ def write_analysis_sheet(workbook: Any, source: Path, rows_read: int, rows_writt
     row += 1
     worksheet.write(row, 0, "Detected Equipment", section_format)
     row += 1
-    for col, header in enumerate(["Equipment group", "Detected columns", "Command/status", "Analog data", "Alarm/trip/fail", "VSD feedback", "Runtime"]):
+    for col, header in enumerate(["Equipment", "Type", "Columns", "Command", "Run proof", "Alarm/trip/fault", "Valve/VSD/analog", "Main observations"]):
         worksheet.write(row, col, header, header_format)
     row += 1
     for state in sorted(analysis.equipment.values(), key=lambda item: item.equipment):
@@ -988,12 +1304,13 @@ def write_analysis_sheet(workbook: Any, source: Path, rows_read: int, rows_writt
             row,
             [
                 state.equipment,
+                state.equipment_type,
                 len(state.columns),
-                "Yes" if state.command_columns or state.status_columns else "No",
-                "Yes" if state.analog_columns else "No",
+                "Yes" if state.command_columns else "No",
+                "Yes" if state.status_columns else "No",
                 "Yes" if state.alarm_columns else "No",
-                "Yes" if state.vsd_columns else "No",
-                "Yes" if state.runtime_columns else "No",
+                "Yes" if state.analog_columns or state.vsd_columns else "No",
+                equipment_observation(state, analysis),
             ],
             value_format,
         )
@@ -1002,11 +1319,13 @@ def write_analysis_sheet(workbook: Any, source: Path, rows_read: int, rows_writt
     row += 2
     worksheet.write(row, 0, "Equipment Operation Summary", section_format)
     row += 1
+    operation_start = row
     op_headers = ["Equipment", "First start", "Last stop", "Starts", "Stops", "Total ON", "ON %", "Longest run", "Short cycles", "Comment"]
     for col, header in enumerate(op_headers):
         worksheet.write(row, col, header, header_format)
     row += 1
     total_minutes = max(trend_duration_minutes(analysis), 1)
+    operation_first_data_row = row
     for state in sorted(analysis.equipment.values(), key=lambda item: equipment_on_minutes(item), reverse=True):
         if not state.status_columns and not state.periods:
             continue
@@ -1034,9 +1353,26 @@ def write_analysis_sheet(workbook: Any, source: Path, rows_read: int, rows_writt
         )
         worksheet.write_number(row, 6, on_minutes / total_minutes, percent_format)
         row += 1
+    operation_last_data_row = row - 1
 
     row += 2
-    worksheet.write(row, 0, "Abnormal Events / Data Quality", section_format)
+    worksheet.write(row, 0, "Event / Alarm Summary", section_format)
+    row += 1
+    event_summary_start = row
+    for col, header in enumerate(["Equipment", "Event type", "First occurrence", "Last occurrence", "Active duration", "Occurrences", "Severity", "Comment"]):
+        worksheet.write(row, col, header, header_format)
+    row += 1
+    event_rows = event_summary_rows(analysis)
+    if not event_rows:
+        event_rows = [["Trend", "none", "Unknown", "Unknown", "0 min", 0, "Info", "No active trip/alarm/fail/lockout periods detected by generic rules."]]
+    for values in event_rows[:80]:
+        fmt = warning_format if values[6] in {"High", "Warning"} else value_format
+        write_table_row(worksheet, row, values, fmt)
+        row += 1
+    event_summary_end = row - 1
+
+    row += 2
+    worksheet.write(row, 0, "Command / Status / Feedback Mismatch", section_format)
     row += 1
     for col, header in enumerate(["Timestamp", "Equipment", "Issue type", "Evidence", "Severity", "Comment"]):
         worksheet.write(row, col, header, header_format)
@@ -1045,6 +1381,28 @@ def write_analysis_sheet(workbook: Any, source: Path, rows_read: int, rows_writt
     for event in events:
         fmt = warning_format if event.severity in {"High", "Warning"} else value_format
         write_table_row(worksheet, row, [format_dt(event.timestamp), event.equipment, event.issue_type, event.evidence, event.severity, event.comment], fmt)
+        row += 1
+
+    row += 2
+    worksheet.write(row, 0, "Data Quality Notes", section_format)
+    row += 1
+    for col, header in enumerate(["Check", "Finding", "Severity"]):
+        worksheet.write(row, col, header, header_format)
+    row += 1
+    for values in data_quality_rows(analysis)[:50]:
+        fmt = warning_format if values[2] == "Warning" else value_format
+        write_table_row(worksheet, row, values, fmt)
+        row += 1
+
+    row += 2
+    section_title, file_specific_headers, file_specific_values = file_specific_rows(analysis)
+    worksheet.write(row, 0, section_title, section_format)
+    row += 1
+    for col, header in enumerate(file_specific_headers):
+        worksheet.write(row, col, header, header_format)
+    row += 1
+    for values in file_specific_values[:80]:
+        write_table_row(worksheet, row, values, value_format)
         row += 1
 
     row += 2
@@ -1094,12 +1452,31 @@ def write_analysis_sheet(workbook: Any, source: Path, rows_read: int, rows_writt
                 })
             analog_chart.set_title({"name": "Selected Analog Trends"})
             worksheet.insert_chart(chart_start + 18, 0, analog_chart, {"x_scale": 1.4, "y_scale": 1.1})
+        if event_summary_end > event_summary_start:
+            event_chart = workbook.add_chart({"type": "bar"})
+            event_chart.add_series({
+                "name": "Event occurrences",
+                "categories": ["Analysis", event_summary_start + 1, 0, event_summary_end, 0],
+                "values": ["Analysis", event_summary_start + 1, 5, event_summary_end, 5],
+            })
+            event_chart.set_title({"name": "Event Count by Equipment"})
+            worksheet.insert_chart(chart_start + 35, 0, event_chart, {"x_scale": 1.3, "y_scale": 1.0})
+        if operation_last_data_row >= operation_first_data_row:
+            runtime_chart = workbook.add_chart({"type": "bar"})
+            runtime_chart.add_series({
+                "name": "Run percentage",
+                "categories": ["Analysis", operation_first_data_row, 0, min(operation_last_data_row, operation_first_data_row + 20), 0],
+                "values": ["Analysis", operation_first_data_row, 6, min(operation_last_data_row, operation_first_data_row + 20), 6],
+            })
+            runtime_chart.set_title({"name": "Runtime Comparison"})
+            runtime_chart.set_x_axis({"num_format": "0%"})
+            worksheet.insert_chart(chart_start + 52, 0, runtime_chart, {"x_scale": 1.3, "y_scale": 1.0})
 
 
 def process_xlsx(source: Path, output_dir: Path, progress: Any) -> ProcessResult:
     import xlsxwriter
 
-    progress(0, "Detecting CSV columns.")
+    progress(0, "Reading file and detecting CSV columns.")
     output_path = output_dir / f"{source.stem}.xlsx"
     workbook = xlsxwriter.Workbook(output_path, {"constant_memory": True, "strings_to_urls": False, "use_zip64": True})
     header_format = workbook.add_format({"bold": True, "bg_color": "#1F2937", "font_color": "white", "border": 1})
@@ -1114,7 +1491,7 @@ def process_xlsx(source: Path, output_dir: Path, progress: Any) -> ProcessResult
     stats, counters = new_stats(headers)
     analysis = build_analyzer(headers)
     analysis.bucket_size_rows = estimate_initial_bucket_size(source)
-    progress(0, "Writing Data sheet and analyzing rows.")
+    progress(0, f"Detected file type: {analysis.file_type}. Writing Data sheet and analyzing equipment.")
     sheet_index = 1
     rows_on_sheet = 0
     rows_read = 0
@@ -1153,7 +1530,7 @@ def process_xlsx(source: Path, output_dir: Path, progress: Any) -> ProcessResult
             progress(rows_read, f"Analyzing rows and writing Data sheet: {rows_read:,} rows.")
 
     finalize_analysis(analysis)
-    progress(rows_read, "Writing Analysis sheet and embedded charts.")
+    progress(rows_read, "Writing Analysis sheet and creating charts.")
     write_analysis_sheet(workbook, source, rows_read, total_rows_written, analysis, "xlsx")
     workbook.close()
     progress(rows_read, "Workbook created.")

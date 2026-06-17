@@ -23,6 +23,8 @@ For large files, embedded charts do not use every raw row. The backend creates h
 - BMS / ACMV operation analysis report in the `Analysis` worksheet
 - Equipment detection for chillers, CHW pumps, condenser pumps, cooling towers, AHU/FCU/fans, valves, VSD/VFD points, MCC/power meters, and unknown equipment
 - Start/stop operation summaries, alarm/trip/fail/lockout events, abnormal condition notes, analog trend summaries, and embedded charts
+- File-type specific review for chiller, AHU, FCU, CT / CHWP / CDWP / VSD, mixed ACMV, and unknown trend exports
+- Command/status/feedback checks for valve, VSD, comfort temperature, humidity, CO2, override, filter dirty, smoke detector, water leak, overload, and general fault points
 - `conversion_report.txt` inside the output ZIP
 
 ## Browser Support
