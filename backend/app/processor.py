@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import math
+import os
 import re
 import sqlite3
 import zipfile
@@ -19,6 +20,8 @@ CHART_ROW_THRESHOLD = 100_000
 MAX_CHART_POINTS = 1500
 SHORT_CYCLE_MINUTES = 10
 COMMAND_RESPONSE_DELAY_MINUTES = 5
+DEFAULT_ASSUMED_CHILLER_RT = 900.0
+MAX_CHILLER_TIMELINE_ROWS = 500
 
 OutputFormat = Literal["xlsx", "sqlite", "parquet"]
 
@@ -123,6 +126,80 @@ class EventRecord:
 
 
 @dataclass
+class ChillerLoadSample:
+    timestamp: datetime | None
+    chiller: str
+    chw_entering: float | None
+    chw_leaving: float | None
+    chw_delta_t: float | None
+    chw_flow: float | None
+    flow_unit: str | None
+    cooling_load_rt: float | None
+    load_percent: float | None
+    controller_capacity_percent: float | None
+    cdw_entering: float | None
+    cdw_leaving: float | None
+    cdw_delta_t: float | None
+
+
+@dataclass
+class ChillerLoadSummary:
+    chiller: str
+    rated_rt: float
+    rated_note: str
+    samples: int = 0
+    dt_sum: float = 0.0
+    dt_max: float | None = None
+    dt_latest: float | None = None
+    rt_sum: float = 0.0
+    rt_count: int = 0
+    rt_max: float | None = None
+    rt_latest: float | None = None
+    load_pct_sum: float = 0.0
+    load_pct_count: int = 0
+    load_pct_max: float | None = None
+    load_pct_latest: float | None = None
+    controller_capacity_latest: float | None = None
+    timeline: list[ChillerLoadSample] = None  # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        self.timeline = []
+
+    def add(self, sample: ChillerLoadSample) -> None:
+        if sample.chw_delta_t is not None:
+            self.samples += 1
+            self.dt_sum += sample.chw_delta_t
+            self.dt_latest = sample.chw_delta_t
+            self.dt_max = sample.chw_delta_t if self.dt_max is None else max(self.dt_max, sample.chw_delta_t)
+        if sample.cooling_load_rt is not None:
+            self.rt_count += 1
+            self.rt_sum += sample.cooling_load_rt
+            self.rt_latest = sample.cooling_load_rt
+            self.rt_max = sample.cooling_load_rt if self.rt_max is None else max(self.rt_max, sample.cooling_load_rt)
+        if sample.load_percent is not None:
+            self.load_pct_count += 1
+            self.load_pct_sum += sample.load_percent
+            self.load_pct_latest = sample.load_percent
+            self.load_pct_max = sample.load_percent if self.load_pct_max is None else max(self.load_pct_max, sample.load_percent)
+        if sample.controller_capacity_percent is not None:
+            self.controller_capacity_latest = sample.controller_capacity_percent
+        if len(self.timeline) < MAX_CHILLER_TIMELINE_ROWS:
+            self.timeline.append(sample)
+        elif self.samples and self.samples % max(1, self.samples // MAX_CHILLER_TIMELINE_ROWS) == 0:
+            self.timeline[-1] = sample
+
+
+@dataclass
+class ChillerTripContext:
+    trip_time: datetime | None
+    chiller: str
+    minutes_since_start: float | None
+    sample: ChillerLoadSample | None
+    classification: str
+    comment: str
+
+
+@dataclass
 class AnalogRecord:
     column: str
     equipment: str
@@ -200,6 +277,8 @@ class TrendAnalysis:
     equipment: dict[str, EquipmentState] = None  # type: ignore[assignment]
     analogs: dict[int, AnalogRecord] = None  # type: ignore[assignment]
     events: list[EventRecord] = None  # type: ignore[assignment]
+    chiller_loads: dict[str, ChillerLoadSummary] = None  # type: ignore[assignment]
+    chiller_trip_contexts: list[ChillerTripContext] = None  # type: ignore[assignment]
     active_periods: dict[int, StatePeriod] = None  # type: ignore[assignment]
     previous_states: dict[int, int] = None  # type: ignore[assignment]
     mismatch_streaks: dict[str, int] = None  # type: ignore[assignment]
@@ -213,6 +292,8 @@ class TrendAnalysis:
         self.equipment = {}
         self.analogs = {}
         self.events = []
+        self.chiller_loads = {}
+        self.chiller_trip_contexts = []
         self.active_periods = {}
         self.previous_states = {}
         self.mismatch_streaks = {}
@@ -238,6 +319,9 @@ class TrendAnalysis:
                 state.vsd_columns.append(meta.index)
             if meta.metric == "runtime":
                 state.runtime_columns.append(meta.index)
+            if meta.equipment_type == "Chiller":
+                rated_rt, rated_note = get_chiller_rated_rt(meta.equipment)
+                self.chiller_loads.setdefault(meta.equipment, ChillerLoadSummary(meta.equipment, rated_rt, rated_note))
 
 def normalize_name(value: Any) -> str:
     text = str(value or "").lower().replace("_", " ").replace("-", " ")
@@ -382,6 +466,8 @@ def parse_equipment_and_metric(header: str) -> tuple[str, str, str]:
         metric = "valve_close_status"
     elif any(token in normalized for token in [" run status ", " running ", " status ", " proof ", " feedback ", " on off "]):
         metric = "run_status"
+    elif any(token in normalized for token in [" load ", " load % ", " percent load ", " capacity ", " capacity % ", " actual capacity ", " vfd capacity ", " demand "]):
+        metric = "controller_capacity"
     elif any(token in normalized for token in [" active power ", " power ", " kw ", " kilowatt "]):
         metric = "active_power"
     elif any(token in normalized for token in [" active energy ", " energy ", " kwh "]):
@@ -396,7 +482,7 @@ def parse_equipment_and_metric(header: str) -> tuple[str, str, str]:
         metric = "temperature"
     elif any(token in normalized for token in [" pressure ", " press ", " differential pressure ", " delta p ", " dp "]):
         metric = "pressure"
-    elif any(token in normalized for token in [" flow ", " airflow ", " air flow ", " water flow "]):
+    elif any(token in normalized for token in [" flow ", " airflow ", " air flow ", " water flow ", " gpm ", " lps ", " l s ", " m3 h ", " m3hr ", " cmh "]):
         metric = "flow"
     elif any(token in normalized for token in [" humidity ", " rh "]):
         metric = "humidity"
@@ -437,7 +523,7 @@ def is_alarm_metric(metric: str) -> bool:
 
 
 def is_meaningful_analog(metric: str) -> bool:
-    return metric in {"active_power", "current", "frequency", "vsd_feedback", "vsd_command", "valve_command", "valve_feedback", "temperature", "pressure", "flow", "humidity", "co2", "setpoint"}
+    return metric in {"active_power", "current", "frequency", "controller_capacity", "vsd_feedback", "vsd_command", "valve_command", "valve_feedback", "temperature", "pressure", "flow", "humidity", "co2", "setpoint"}
 
 
 def analog_near_zero_threshold(metric: str) -> float:
@@ -477,6 +563,54 @@ def parse_state(value: Any) -> int | None:
     if number is None:
         return None
     return 1 if abs(number) > 0.1 else 0
+
+
+def get_chiller_number(equipment: str) -> str | None:
+    match = re.search(r"(\d+)", equipment)
+    return match.group(1) if match else None
+
+
+def get_chiller_rated_rt(equipment: str) -> tuple[float, str]:
+    number = get_chiller_number(equipment)
+    keys = [f"CHILLER_{number}_RT"] if number else []
+    keys.append("DEFAULT_CHILLER_RT")
+    for key in keys:
+        raw = os.getenv(key)
+        if raw:
+            try:
+                value = float(raw)
+                if value > 0:
+                    return value, f"Rated capacity from {key}: {value:g} RT"
+            except ValueError:
+                continue
+    return DEFAULT_ASSUMED_CHILLER_RT, f"Rated chiller capacity assumed as {DEFAULT_ASSUMED_CHILLER_RT:g} RT. Update configuration if actual capacity differs."
+
+
+def detect_flow_unit(header: str) -> str | None:
+    text = compact_name(header).replace(" ", "")
+    spaced = f" {compact_name(header)} "
+    if "gpm" in text:
+        return "gpm"
+    if "l/s" in header.lower() or "lps" in text or "ls" in text or "l s" in spaced:
+        return "l/s"
+    if "m3/h" in header.lower() or "m3hr" in text or "m3h" in text or "cmh" in text:
+        return "m3/h"
+    return None
+
+
+def cooling_load_rt(flow: float | None, unit: str | None, delta_t: float | None) -> float | None:
+    if flow is None or unit is None or delta_t is None:
+        return None
+    if delta_t < 0:
+        return None
+    if unit == "gpm":
+        return flow * delta_t / 24
+    if unit == "l/s":
+        return flow * 4.186 * delta_t / 3.517
+    if unit == "m3/h":
+        flow_lps = flow * 1000 / 3600
+        return flow_lps * 4.186 * delta_t / 3.517
+    return None
 
 
 def format_dt(value: datetime | None) -> str:
@@ -716,6 +850,129 @@ def states_for_metrics(analysis: TrendAnalysis, row: list[str], equipment: str, 
     return states
 
 
+def named_values_for_metrics(analysis: TrendAnalysis, row: list[str], equipment: str, metrics: set[str]) -> list[tuple[ColumnMeta, float]]:
+    values: list[tuple[ColumnMeta, float]] = []
+    for meta in analysis.metas:
+        if meta.equipment != equipment or meta.metric not in metrics or meta.index >= len(row):
+            continue
+        number = parse_number(row[meta.index])
+        if number is not None:
+            values.append((meta, number))
+    return values
+
+
+def best_value_by_keywords(values: list[tuple[ColumnMeta, float]], required: list[str], optional: list[str] | None = None) -> float | None:
+    optional = optional or []
+    best: tuple[int, float] | None = None
+    for meta, value in values:
+        text = compact_name(meta.name)
+        if not all(keyword in text for keyword in required):
+            continue
+        score = len(required) * 10 + sum(1 for keyword in optional if keyword in text)
+        if best is None or score > best[0]:
+            best = (score, value)
+    return best[1] if best else None
+
+
+def build_chiller_load_sample(analysis: TrendAnalysis, row: list[str], chiller: str, timestamp: datetime | None) -> ChillerLoadSample | None:
+    temp_values = named_values_for_metrics(analysis, row, chiller, {"temperature"})
+    flow_values = named_values_for_metrics(analysis, row, chiller, {"flow"})
+    capacity_values = named_values_for_metrics(analysis, row, chiller, {"controller_capacity"})
+    chw_entering = (
+        best_value_by_keywords(temp_values, ["evap", "entering"]) or
+        best_value_by_keywords(temp_values, ["chw", "return"]) or
+        best_value_by_keywords(temp_values, ["chwr"]) or
+        best_value_by_keywords(temp_values, ["ewt"]) or
+        best_value_by_keywords(temp_values, ["entering", "water"])
+    )
+    chw_leaving = (
+        best_value_by_keywords(temp_values, ["evap", "leaving"]) or
+        best_value_by_keywords(temp_values, ["chw", "supply"]) or
+        best_value_by_keywords(temp_values, ["chws"]) or
+        best_value_by_keywords(temp_values, ["lwt"]) or
+        best_value_by_keywords(temp_values, ["leaving", "water"])
+    )
+    cdw_entering = (
+        best_value_by_keywords(temp_values, ["cond", "entering"]) or
+        best_value_by_keywords(temp_values, ["cdw", "entering"])
+    )
+    cdw_leaving = (
+        best_value_by_keywords(temp_values, ["cond", "leaving"]) or
+        best_value_by_keywords(temp_values, ["cdw", "leaving"])
+    )
+    flow_pair = next(((meta, value) for meta, value in flow_values if detect_flow_unit(meta.name)), None)
+    flow_meta, flow_value = flow_pair if flow_pair else (None, None)
+    flow_unit = detect_flow_unit(flow_meta.name) if flow_meta else None
+    controller_capacity = capacity_values[0][1] if capacity_values else None
+    chw_delta = (chw_entering - chw_leaving) if chw_entering is not None and chw_leaving is not None else None
+    cdw_delta = (cdw_leaving - cdw_entering) if cdw_entering is not None and cdw_leaving is not None else None
+    if chw_delta is None and flow_value is None and controller_capacity is None and cdw_delta is None:
+        return None
+    load_rt = cooling_load_rt(flow_value, flow_unit, chw_delta)
+    summary = analysis.chiller_loads.get(chiller)
+    load_percent = (load_rt / summary.rated_rt * 100) if load_rt is not None and summary and summary.rated_rt > 0 else None
+    return ChillerLoadSample(
+        timestamp=timestamp,
+        chiller=chiller,
+        chw_entering=chw_entering,
+        chw_leaving=chw_leaving,
+        chw_delta_t=chw_delta,
+        chw_flow=flow_value,
+        flow_unit=flow_unit,
+        cooling_load_rt=load_rt,
+        load_percent=load_percent,
+        controller_capacity_percent=controller_capacity,
+        cdw_entering=cdw_entering,
+        cdw_leaving=cdw_leaving,
+        cdw_delta_t=cdw_delta,
+    )
+
+
+def current_run_start(analysis: TrendAnalysis, chiller: str) -> datetime | None:
+    for index, period in analysis.active_periods.items():
+        if period.equipment == chiller and analysis.metas[index].metric in {"run_status", "status"}:
+            return period.start_time
+    return None
+
+
+def classify_chiller_trip(sample: ChillerLoadSample | None, minutes_since_start: float | None) -> tuple[str, str]:
+    if sample is None:
+        return "Insufficient data", "Trip occurred, but water-side temperature/load context is unavailable."
+    low_load = (sample.load_percent is not None and sample.load_percent < 15) or (sample.chw_delta_t is not None and sample.chw_delta_t < 2)
+    high_load = sample.load_percent is not None and sample.load_percent >= 85
+    loaded = (sample.cooling_load_rt is not None and sample.cooling_load_rt >= 0.25 * DEFAULT_ASSUMED_CHILLER_RT) or (sample.chw_delta_t is not None and sample.chw_delta_t >= 4)
+    cdw_abnormal = sample.cdw_delta_t is not None and sample.cdw_delta_t <= 0
+    leaving_low = sample.chw_leaving is not None and sample.chw_leaving < 4
+    if minutes_since_start is not None and minutes_since_start <= 10 and low_load:
+        return "Startup low-load trip", "Trip occurred shortly after start with low calculated RT or low CHW delta-T."
+    if high_load:
+        return "High load trip", "Trip occurred while calculated load percentage was high."
+    if loaded and cdw_abnormal:
+        return "CHW load present but CDW heat rejection weak", "CHW load is present while CDW delta-T is low/negative; check heat rejection or sensor mapping."
+    if leaving_low or (low_load and sample.chw_flow is None):
+        return "Possible freeze protection / low flow", "Leaving water temperature or low-load/unknown-flow pattern suggests freeze/flow review."
+    if loaded:
+        return "Loaded running trip", "Trip occurred with meaningful CHW delta-T or calculated RT."
+    return "Insufficient data", "Trip classification is limited by missing flow/temperature context."
+
+
+def update_chiller_load_analysis(analysis: TrendAnalysis, row: list[str], timestamp: datetime | None) -> None:
+    for state in analysis.equipment.values():
+        if state.equipment_type != "Chiller":
+            continue
+        sample = build_chiller_load_sample(analysis, row, state.equipment, timestamp)
+        if sample is not None:
+            analysis.chiller_loads[state.equipment].add(sample)
+
+
+def add_chiller_trip_context(analysis: TrendAnalysis, row: list[str], timestamp: datetime | None, chiller: str) -> None:
+    sample = build_chiller_load_sample(analysis, row, chiller, timestamp)
+    start_time = current_run_start(analysis, chiller)
+    minutes_since_start = (timestamp - start_time).total_seconds() / 60 if timestamp and start_time else None
+    classification, comment = classify_chiller_trip(sample, minutes_since_start)
+    analysis.chiller_trip_contexts.append(ChillerTripContext(timestamp, chiller, minutes_since_start, sample, classification, comment))
+
+
 def evaluate_equipment_rules(analysis: TrendAnalysis, row: list[str], timestamp: datetime | None) -> None:
     for state in analysis.equipment.values():
         command_states = [parse_state(row[index]) for index in state.command_columns if index < len(row)]
@@ -937,11 +1194,15 @@ def update_analysis(analysis: TrendAnalysis, row: list[str]) -> None:
                 analysis.active_periods[meta.index] = StatePeriod(meta.equipment, meta.name, timestamp, None, analysis.rows_read, analysis.rows_read, state)
                 if meta.is_alarm:
                     analysis.events.append(EventRecord(timestamp, meta.equipment, meta.metric, meta.name, "High", f"{meta.name} became active."))
+                    if meta.equipment_type == "Chiller" and meta.metric in {"trip", "lockout", "fail", "overload_trip"}:
+                        add_chiller_trip_context(analysis, row, timestamp, meta.equipment)
             else:
                 if meta.metric in {"run_status", "status", "valve_open_status"} and equipment_state:
                     equipment_state.stops += 1
                 close_active_period(analysis, meta.index, timestamp, analysis.rows_read)
 
+    if analysis.file_type in {"chiller", "mixed ACMV"}:
+        update_chiller_load_analysis(analysis, row, timestamp)
     update_chart_bucket(analysis, row, timestamp)
     evaluate_equipment_rules(analysis, row, timestamp)
 
@@ -1161,23 +1422,101 @@ def data_quality_rows(analysis: TrendAnalysis) -> list[list[Any]]:
     return rows or [["No major data quality issue", "No timestamp gaps, duplicates, or obvious constant analog problems detected by generic rules.", "Info"]]
 
 
+def avg(total: float, count: int) -> float | None:
+    return total / count if count else None
+
+
+def chiller_load_status(summary: ChillerLoadSummary) -> str:
+    if summary.rt_count:
+        return "Calculated from CHW flow and CHW delta-T"
+    has_dt = summary.samples > 0
+    if has_dt:
+        return "Cooling load RT unavailable; CHW delta-T used as load indication because CHW flow is missing or unit is unknown"
+    return "Cooling load RT unavailable; CHW temperature differential could not be confirmed"
+
+
+def chiller_load_summary_rows(analysis: TrendAnalysis) -> list[list[Any]]:
+    rows: list[list[Any]] = []
+    for summary in analysis.chiller_loads.values():
+        rows.append([
+            summary.chiller,
+            avg(summary.dt_sum, summary.samples),
+            summary.dt_max,
+            summary.dt_latest,
+            avg(summary.rt_sum, summary.rt_count),
+            summary.rt_max,
+            summary.rt_latest,
+            avg(summary.load_pct_sum, summary.load_pct_count),
+            summary.load_pct_max,
+            summary.load_pct_latest,
+            f"{summary.rated_rt:g} RT",
+            chiller_load_status(summary),
+            summary.rated_note,
+        ])
+    return rows
+
+
+def chiller_timeline_rows(analysis: TrendAnalysis) -> list[list[Any]]:
+    rows: list[list[Any]] = []
+    for summary in analysis.chiller_loads.values():
+        for sample in summary.timeline[:MAX_CHILLER_TIMELINE_ROWS]:
+            rows.append([
+                format_dt(sample.timestamp),
+                sample.chiller,
+                sample.chw_entering,
+                sample.chw_leaving,
+                sample.chw_delta_t,
+                sample.chw_flow,
+                sample.flow_unit or "Unknown",
+                sample.cooling_load_rt,
+                sample.load_percent,
+                sample.controller_capacity_percent,
+            ])
+    return rows
+
+
+def chiller_trip_context_rows(analysis: TrendAnalysis) -> list[list[Any]]:
+    rows: list[list[Any]] = []
+    for context in analysis.chiller_trip_contexts:
+        sample = context.sample
+        rows.append([
+            format_dt(context.trip_time),
+            context.chiller,
+            context.minutes_since_start,
+            sample.chw_entering if sample else None,
+            sample.chw_leaving if sample else None,
+            sample.chw_delta_t if sample else None,
+            sample.chw_flow if sample else None,
+            sample.flow_unit if sample and sample.flow_unit else "Unknown",
+            sample.cooling_load_rt if sample else None,
+            sample.load_percent if sample else None,
+            sample.controller_capacity_percent if sample else None,
+            sample.cdw_entering if sample else None,
+            sample.cdw_leaving if sample else None,
+            sample.cdw_delta_t if sample else None,
+            context.classification,
+            context.comment,
+        ])
+    return rows
+
+
 def file_specific_rows(analysis: TrendAnalysis) -> tuple[str, list[str], list[list[Any]]]:
     if analysis.file_type == "chiller":
-        rows = []
-        for state in analysis.equipment.values():
-            if state.equipment_type != "Chiller":
-                continue
-            trip_events = [event for event in analysis.events if event.equipment == state.equipment and event.issue_type in {"trip", "lockout", "fail"}]
-            chw = [analog for analog in analysis.analogs.values() if analog.equipment == state.equipment and analog.metric == "temperature" and any(token in compact_name(analog.column) for token in ["evap", "chw", "leaving", "entering"])]
-            cdw = [analog for analog in analysis.analogs.values() if analog.equipment == state.equipment and analog.metric == "temperature" and any(token in compact_name(analog.column) for token in ["cond", "cdw", "leaving", "entering"])]
-            classification = "Insufficient data"
-            if trip_events and equipment_on_minutes(state) <= SHORT_CYCLE_MINUTES:
-                classification = "Startup low water-load trip pattern possible"
-            elif trip_events and equipment_on_minutes(state) > SHORT_CYCLE_MINUTES:
-                classification = "Loaded running trip pattern possible"
-            comment = "Use CHW/CDW delta-T and valve proof as primary load evidence; current/VFD are secondary evidence."
-            rows.append([state.equipment, len(trip_events), format_duration(equipment_on_minutes(state)), len(chw), len(cdw), classification, comment])
-        return "Chiller Trip / Water-Side Review", ["Chiller", "Trip events", "Run duration", "CHW temp points", "CDW temp points", "Classification", "Engineering comment"], rows
+        return "Cooling Load Summary", [
+            "Chiller",
+            "Avg CHW Delta-T",
+            "Max CHW Delta-T",
+            "Latest CHW Delta-T",
+            "Avg RT",
+            "Max RT",
+            "Latest RT",
+            "Avg load %",
+            "Max load %",
+            "Latest load %",
+            "Rated RT used",
+            "RT status",
+            "Capacity note",
+        ], chiller_load_summary_rows(analysis)
     if analysis.file_type == "AHU":
         return "AHU Comfort / Valve / VSD Review", ["AHU", "Run duration", "Events", "Valve/VSD points", "Comfort points", "Observation"], [
             [
@@ -1261,6 +1600,7 @@ def write_analysis_sheet(workbook: Any, source: Path, rows_read: int, rows_writt
     worksheet.set_column("A:A", 24)
     worksheet.set_column("B:B", 28)
     worksheet.set_column("C:H", 18)
+    worksheet.set_column("I:P", 18)
     worksheet.merge_range("A1:H1", "BMS / ACMV Operation Analysis Report", title_format)
     systems = sorted({meta.equipment for meta in analysis.metas if meta.equipment != "Unknown Equipment"})
     overview = [
@@ -1405,6 +1745,78 @@ def write_analysis_sheet(workbook: Any, source: Path, rows_read: int, rows_writt
         write_table_row(worksheet, row, values, value_format)
         row += 1
 
+    chiller_timeline_first_row: int | None = None
+    chiller_timeline_last_row: int | None = None
+    if analysis.file_type == "chiller":
+        row += 2
+        worksheet.write(row, 0, "Cooling Load Timeline", section_format)
+        row += 1
+        timeline_headers = [
+            "Timestamp",
+            "Chiller",
+            "CHW entering",
+            "CHW leaving",
+            "CHW Delta-T",
+            "CHW flow",
+            "Flow unit",
+            "Cooling load RT",
+            "Load %",
+            "Controller capacity %",
+        ]
+        for col, header in enumerate(timeline_headers):
+            worksheet.write(row, col, header, header_format)
+        row += 1
+        timeline_rows = chiller_timeline_rows(analysis)
+        if timeline_rows:
+            chiller_timeline_first_row = row
+            for values in timeline_rows[:MAX_CHILLER_TIMELINE_ROWS]:
+                write_table_row(worksheet, row, values, value_format)
+                row += 1
+            chiller_timeline_last_row = row - 1
+        else:
+            worksheet.merge_range(
+                row,
+                0,
+                row,
+                9,
+                "Cooling load RT cannot be calculated because CHW flow and/or CHW entering/leaving temperature points are not available.",
+                value_format,
+            )
+            row += 1
+
+        row += 2
+        worksheet.write(row, 0, "Trip Event Context", section_format)
+        row += 1
+        trip_headers = [
+            "Trip time",
+            "Chiller",
+            "Minutes since start",
+            "CHW entering",
+            "CHW leaving",
+            "CHW Delta-T",
+            "CHW flow",
+            "Flow unit",
+            "Calculated RT",
+            "Load %",
+            "Controller capacity %",
+            "CDW entering",
+            "CDW leaving",
+            "CDW Delta-T",
+            "Trip classification",
+            "Engineering comment",
+        ]
+        for col, header in enumerate(trip_headers):
+            worksheet.write(row, col, header, header_format)
+        row += 1
+        trip_rows = chiller_trip_context_rows(analysis)
+        if trip_rows:
+            for values in trip_rows[:80]:
+                write_table_row(worksheet, row, values, warning_format)
+                row += 1
+        else:
+            worksheet.merge_range(row, 0, row, 15, "No chiller trip context captured from active trip/lockout/fail transitions.", value_format)
+            row += 1
+
     row += 2
     worksheet.write(row, 0, "Analog Trend Summary", section_format)
     row += 1
@@ -1471,6 +1883,36 @@ def write_analysis_sheet(workbook: Any, source: Path, rows_read: int, rows_writt
             runtime_chart.set_title({"name": "Runtime Comparison"})
             runtime_chart.set_x_axis({"num_format": "0%"})
             worksheet.insert_chart(chart_start + 52, 0, runtime_chart, {"x_scale": 1.3, "y_scale": 1.0})
+        if analysis.file_type == "chiller" and chiller_timeline_first_row is not None and chiller_timeline_last_row is not None:
+            chiller_chart = workbook.add_chart({"type": "line"})
+            has_calculated_rt = any(summary.rt_count for summary in analysis.chiller_loads.values())
+            if has_calculated_rt:
+                chiller_chart.add_series({
+                    "name": "Cooling load RT",
+                    "categories": ["Analysis", chiller_timeline_first_row, 0, chiller_timeline_last_row, 0],
+                    "values": ["Analysis", chiller_timeline_first_row, 7, chiller_timeline_last_row, 7],
+                })
+                chiller_chart.add_series({
+                    "name": "Load %",
+                    "categories": ["Analysis", chiller_timeline_first_row, 0, chiller_timeline_last_row, 0],
+                    "values": ["Analysis", chiller_timeline_first_row, 8, chiller_timeline_last_row, 8],
+                    "y2_axis": True,
+                })
+                chiller_chart.set_title({"name": "Calculated Cooling Load RT / Load %"})
+            else:
+                chiller_chart.add_series({
+                    "name": "CHW Delta-T",
+                    "categories": ["Analysis", chiller_timeline_first_row, 0, chiller_timeline_last_row, 0],
+                    "values": ["Analysis", chiller_timeline_first_row, 4, chiller_timeline_last_row, 4],
+                })
+                chiller_chart.add_series({
+                    "name": "Controller capacity %",
+                    "categories": ["Analysis", chiller_timeline_first_row, 0, chiller_timeline_last_row, 0],
+                    "values": ["Analysis", chiller_timeline_first_row, 9, chiller_timeline_last_row, 9],
+                    "y2_axis": True,
+                })
+                chiller_chart.set_title({"name": "CHW Delta-T / Controller Capacity Reference"})
+            worksheet.insert_chart(chart_start + 69, 0, chiller_chart, {"x_scale": 1.4, "y_scale": 1.0})
 
 
 def process_xlsx(source: Path, output_dir: Path, progress: Any) -> ProcessResult:

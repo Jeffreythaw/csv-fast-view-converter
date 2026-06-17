@@ -25,7 +25,21 @@ For large files, embedded charts do not use every raw row. The backend creates h
 - Start/stop operation summaries, alarm/trip/fail/lockout events, abnormal condition notes, analog trend summaries, and embedded charts
 - File-type specific review for chiller, AHU, FCU, CT / CHWP / CDWP / VSD, mixed ACMV, and unknown trend exports
 - Command/status/feedback checks for valve, VSD, comfort temperature, humidity, CO2, override, filter dirty, smoke detector, water leak, overload, and general fault points
+- Chiller cooling load calculation from CHW flow and CHW Delta-T when flow unit is known; otherwise the report uses CHW Delta-T as load indication and clearly marks RT unavailable
 - `conversion_report.txt` inside the output ZIP
+
+## Chiller Rated Capacity
+
+Chiller load percentage uses configured rated RT when available:
+
+```bash
+DEFAULT_CHILLER_RT=900
+CHILLER_1_RT=900
+CHILLER_2_RT=900
+CHILLER_3_RT=900
+```
+
+If no value is set, the backend uses `900 RT` as an assumed default and writes that assumption into the `Analysis` worksheet.
 
 ## Browser Support
 
