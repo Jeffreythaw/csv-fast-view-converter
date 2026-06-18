@@ -4,8 +4,6 @@ import csv
 import math
 import os
 import re
-import sqlite3
-import zipfile
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
@@ -15,7 +13,6 @@ from typing import Any, Literal
 EXCEL_MAX_ROWS = 1_048_576
 EXCEL_DATA_ROWS_PER_SHEET = EXCEL_MAX_ROWS - 1
 MAX_COLUMNS = 300
-STATUS_LIMIT = 50
 CHART_ROW_THRESHOLD = 100_000
 MAX_CHART_POINTS = 1500
 SHORT_CYCLE_MINUTES = 10
@@ -23,73 +20,16 @@ COMMAND_RESPONSE_DELAY_MINUTES = 5
 DEFAULT_ASSUMED_CHILLER_RT = 900.0
 MAX_CHILLER_TIMELINE_ROWS = 500
 
-OutputFormat = Literal["xlsx", "sqlite", "parquet"]
+OutputFormat = Literal["xlsx"]
 
 TRUE_VALUES = {"1", "true", "on", "run", "running", "open", "start", "enabled", "alarm"}
 FALSE_VALUES = {"0", "false", "off", "stop", "stopped", "closed", "close", "disabled", "normal"}
 ACTIVE_STATUS_VALUES = {"alarm", "trip", "fault", "lockout", "fail", "failure", "warning", "on", "true", "run", "running", "open", "start", "enabled", "1"}
 
-CATEGORY_KEYWORDS: list[tuple[str, list[str]]] = [
-    ("alarm_trip_lockout", ["alarm", "trip", "fault", "lockout", "fail", "failure", "warning"]),
-    ("temperature", ["temperature", " temp", "chwst", "chwrt", "chws", "chwr", "lwt", "ewt", "supply temp", "return temp", "sat", "rat", "room temp"]),
-    ("pressure", ["pressure", "press", " dp ", "differential pressure", "delta p"]),
-    ("flow", ["flow", "water flow", "air flow", "airflow", "gpm", "l/s", "lpm", "cmh"]),
-    ("current", ["current", "amp", "amps", "motor current", "rla"]),
-    ("load", ["load", "percent load", "demand", "capacity"]),
-    ("speed_frequency", ["speed", "frequency", "hz"]),
-    ("valve", ["valve", "vlv", "chw valve", "cdw valve", "open", "opening"]),
-    ("pump", ["pump", "chwp", "cdwp", "chw pump", "cdw pump"]),
-    ("fan", ["fan", "blower", "exhaust fan", "supply fan", "return fan", " ef ", "saf", "raf"]),
-    ("chiller", ["chiller", "chill", "19dv", "23xrv", " ch1", " ch2", " ch3", " ch "]),
-    ("ahu", ["ahu", "air handling unit"]),
-    ("fcu", ["fcu", "fan coil"]),
-    ("setpoint", ["setpoint", "set point", " sp ", "target"]),
-    ("command", ["command", "cmd", "enable", "enabled", "start", "stop"]),
-    ("status", ["status", "run", "running", "proof", "feedback", "on/off", " on ", " off "]),
-    ("humidity", ["humidity", " rh ", "relative humidity"]),
-]
-
-
-@dataclass
-class NumericStat:
-    column: str
-    index: int
-    category: str
-    count: int = 0
-    mean: float = 0.0
-    m2: float = 0.0
-    minimum: float | None = None
-    maximum: float | None = None
-    first: float | None = None
-    latest: float | None = None
-
-    def add(self, value: float) -> None:
-        if self.first is None:
-            self.first = value
-        self.latest = value
-        self.count += 1
-        delta = value - self.mean
-        self.mean += delta / self.count
-        self.m2 += delta * (value - self.mean)
-        self.minimum = value if self.minimum is None else min(self.minimum, value)
-        self.maximum = value if self.maximum is None else max(self.maximum, value)
-
-    @property
-    def std_dev(self) -> float:
-        return math.sqrt(self.m2 / self.count) if self.count > 1 else 0.0
-
-    @property
-    def change(self) -> float:
-        if self.first is None or self.latest is None:
-            return 0.0
-        return self.latest - self.first
-
-
 @dataclass
 class ProcessResult:
     rows_read: int
-    output_files: list[Path]
-    report: str
+    output_path: Path
 
 
 @dataclass
@@ -371,16 +311,6 @@ def detect_datetime_index(headers: list[str]) -> int | None:
     return 0 if headers else None
 
 
-def classify_column(header: str) -> str:
-    normalized = normalize_name(header)
-    if any(token in normalized for token in [" date ", " time ", " timestamp ", " datetime "]):
-        return "datetime"
-    for category, keywords in CATEGORY_KEYWORDS:
-        if any(keyword in normalized for keyword in keywords):
-            return category
-    return "unknown"
-
-
 def parse_equipment_and_metric(header: str) -> tuple[str, str, str]:
     text = compact_name(header)
     normalized = f" {text} "
@@ -651,28 +581,6 @@ def unique_headers(headers: list[str]) -> list[str]:
         seen[base] = count + 1
         unique.append(base if count == 0 else f"{base}_{count + 1}")
     return unique
-
-
-def safe_table_name(value: str) -> str:
-    cleaned = "".join(char if char.isalnum() or char == "_" else "_" for char in value.strip().lower())
-    return cleaned or "trend_data"
-
-
-def unique_sql_names(headers: list[str]) -> list[str]:
-    seen: dict[str, int] = {}
-    names: list[str] = []
-    for index, header in enumerate(headers):
-        base = safe_table_name(header) or f"column_{index + 1}"
-        if base[0].isdigit():
-            base = f"column_{base}"
-        count = seen.get(base, 0)
-        seen[base] = count + 1
-        names.append(base if count == 0 else f"{base}_{count + 1}")
-    return names
-
-
-def quote_sqlite_identifier(value: str) -> str:
-    return f'"{value.replace("\"", "\"\"")}"'
 
 
 def parse_number(value: Any) -> float | None:
@@ -1292,7 +1200,7 @@ def update_analysis(analysis: TrendAnalysis, row: list[str]) -> None:
 
     if analysis.rows_read > 50_000:
         analysis.summary_mode = True
-    if not analysis.summary_mode and analysis.file_type in {"chiller", "mixed ACMV"}:
+    if analysis.file_type in {"chiller", "mixed ACMV"}:
         update_chiller_load_analysis(analysis, row, timestamp)
     update_chart_bucket(analysis, row, timestamp)
     if not analysis.summary_mode:
@@ -1363,45 +1271,6 @@ def add_generic_findings(analysis: TrendAnalysis) -> None:
     for analog in analysis.analogs.values():
         if analog.count >= 10 and analog.std_dev < 0.0001:
             analysis.events.append(EventRecord(None, analog.equipment, "constant_analog", analog.column, "Info", "Analog value is mostly constant and may not be useful for charting."))
-def new_stats(headers: list[str]) -> tuple[list[NumericStat], list[Counter[str]]]:
-    stats = [NumericStat(header, index, classify_column(header)) for index, header in enumerate(headers)]
-    counters = [Counter() for _ in headers]
-    return stats, counters
-
-
-def update_profiles(row: list[str], stats: list[NumericStat], counters: list[Counter[str]]) -> None:
-    for index, value in enumerate(row):
-        number = parse_number(value)
-        if number is not None:
-            stats[index].add(number)
-        category = stats[index].category
-        if category in {"status", "command", "alarm_trip_lockout", "pump", "fan", "chiller", "ahu", "fcu", "valve"}:
-            text = value.strip()
-            if text and len(counters[index]) <= STATUS_LIMIT:
-                counters[index][text] += 1
-
-
-def build_report(source: Path, rows_read: int, output_files: list[Path], stats: list[NumericStat], counters: list[Counter[str]]) -> str:
-    lines = [
-        "CSV Fast View Conversion Report",
-        f"Source: {source.name}",
-        f"Rows read: {rows_read:,}",
-        f"Output files: {len(output_files)}",
-        "",
-        "Numeric columns:",
-    ]
-    for stat in sorted((item for item in stats if item.count), key=lambda item: item.count, reverse=True)[:20]:
-        lines.append(
-            f"- {stat.column}: count={stat.count:,}, avg={stat.mean:.4f}, min={(stat.minimum or 0):.4f}, max={(stat.maximum or 0):.4f}, latest={(stat.latest or 0):.4f}"
-        )
-    lines.extend(["", "Status columns:"])
-    for stat, counter in zip(stats, counters, strict=False):
-        if not counter:
-            continue
-        top_state, top_count = counter.most_common(1)[0]
-        active = sum(count for value, count in counter.items() if value.lower() in ACTIVE_STATUS_VALUES)
-        lines.append(f"- {stat.column}: states={len(counter)}, top={top_state} ({top_count:,}), active={active:,}")
-    return "\n".join(lines)
 
 
 def estimate_initial_bucket_size(source: Path) -> int:
@@ -1656,31 +1525,31 @@ def write_table_row(worksheet: Any, row: int, values: list[Any], fmt: Any) -> No
             worksheet.write(row, col, value, fmt)
 
 
-def write_chart_helper(workbook: Any, analysis: TrendAnalysis) -> Any:
-    helper = workbook.add_worksheet("_ChartHelper")
-    helper.hide()
+def write_chart_helper(worksheet: Any, analysis: TrendAnalysis, start_row: int, start_col: int = 17) -> tuple[int, int]:
     headers = ["Time"]
     analog_names = [analysis.headers[index] for index in analysis.chart_columns]
     status_names = [analysis.headers[index] for index in analysis.chart_status_columns]
     headers.extend(analog_names)
     headers.extend(status_names)
     for col, header in enumerate(headers):
-        helper.write(0, col, header)
-    for row_index, bucket in enumerate(analysis.chart_buckets[:MAX_CHART_POINTS], start=1):
-        helper.write(row_index, 0, format_dt(bucket.start) if bucket.start else str(bucket.row_start))
-        col = 1
+        worksheet.write(start_row, start_col + col, header)
+    for row_offset, bucket in enumerate(analysis.chart_buckets[:MAX_CHART_POINTS], start=1):
+        worksheet.write(start_row + row_offset, start_col, format_dt(bucket.start) if bucket.start else str(bucket.row_start))
+        col = start_col + 1
         for name in analog_names:
             values = bucket.values.get(name, [])
-            helper.write_number(row_index, col, sum(values) / len(values) if values else 0)
+            worksheet.write_number(start_row + row_offset, col, sum(values) / len(values) if values else 0)
             col += 1
         for name in status_names:
             values = bucket.states.get(name, [])
-            helper.write_number(row_index, col, max(values) if values else 0)
+            worksheet.write_number(start_row + row_offset, col, max(values) if values else 0)
             col += 1
-    return helper
+    if headers:
+        worksheet.set_column(start_col, start_col + len(headers) - 1, None, None, {"hidden": True})
+    return start_row, start_col
 
 
-def write_analysis_sheet(workbook: Any, source: Path, rows_read: int, rows_written: int, analysis: TrendAnalysis, output_kind: str) -> None:
+def write_detailed_analysis_sheet_legacy(workbook: Any, source: Path, rows_read: int, rows_written: int, analysis: TrendAnalysis, output_kind: str) -> None:
     worksheet = workbook.add_worksheet("Analysis")
     title_format = workbook.add_format({"bold": True, "font_size": 16, "font_color": "white", "bg_color": "#0F172A", "align": "center"})
     section_format = workbook.add_format({"bold": True, "font_color": "white", "bg_color": "#334155", "border": 1})
@@ -1708,7 +1577,7 @@ def write_analysis_sheet(workbook: Any, source: Path, rows_read: int, rows_writt
         ("Analysis mode", "Summary Mode" if analysis.summary_mode else "Detailed Mode"),
         ("Detected systems", ", ".join(systems[:12]) if systems else "Unknown"),
         ("Output", output_kind),
-        ("Excel sheet split", "Automatic at 1,048,576 rows per sheet"),
+        ("Data sheet row limit", f"{EXCEL_DATA_ROWS_PER_SHEET:,} data rows"),
         ("Chart data mode", f"Aggregated every {analysis.bucket_size_rows:,} row(s)" if analysis.bucket_size_rows > 1 else "Raw rows used; under chart threshold"),
     ]
     worksheet.write("A3", "Overview", section_format)
@@ -1931,18 +1800,18 @@ def write_analysis_sheet(workbook: Any, source: Path, rows_read: int, rows_writt
         worksheet.write_number(row, 8, zero_pct, percent_format)
         row += 1
 
-    helper = write_chart_helper(workbook, analysis)
     chart_start = row + 2
     worksheet.write(chart_start, 0, "Charts", section_format)
+    helper_row, helper_col = write_chart_helper(worksheet, analysis, chart_start, 17)
     point_count = min(len(analysis.chart_buckets), MAX_CHART_POINTS)
     if point_count >= 2:
         if analysis.chart_status_columns:
             status_chart = workbook.add_chart({"type": "line"})
             for series_index, column_index in enumerate(analysis.chart_status_columns[:6], start=1 + len(analysis.chart_columns)):
                 status_chart.add_series({
-                    "name": ["_ChartHelper", 0, series_index],
-                    "categories": ["_ChartHelper", 1, 0, point_count, 0],
-                    "values": ["_ChartHelper", 1, series_index, point_count, series_index],
+                    "name": ["Analysis", helper_row, helper_col + series_index],
+                    "categories": ["Analysis", helper_row + 1, helper_col, helper_row + point_count, helper_col],
+                    "values": ["Analysis", helper_row + 1, helper_col + series_index, helper_row + point_count, helper_col + series_index],
                 })
             status_chart.set_title({"name": "Equipment Run Status Timeline"})
             status_chart.set_y_axis({"name": "State", "min": 0, "max": 1})
@@ -1951,9 +1820,9 @@ def write_analysis_sheet(workbook: Any, source: Path, rows_read: int, rows_writt
             analog_chart = workbook.add_chart({"type": "line"})
             for series_index, _column_index in enumerate(analysis.chart_columns[:5], start=1):
                 analog_chart.add_series({
-                    "name": ["_ChartHelper", 0, series_index],
-                    "categories": ["_ChartHelper", 1, 0, point_count, 0],
-                    "values": ["_ChartHelper", 1, series_index, point_count, series_index],
+                    "name": ["Analysis", helper_row, helper_col + series_index],
+                    "categories": ["Analysis", helper_row + 1, helper_col, helper_row + point_count, helper_col],
+                    "values": ["Analysis", helper_row + 1, helper_col + series_index, helper_row + point_count, helper_col + series_index],
                 })
             analog_chart.set_title({"name": "Selected Analog Trends"})
             worksheet.insert_chart(chart_start + 18, 0, analog_chart, {"x_scale": 1.4, "y_scale": 1.1})
@@ -2008,47 +1877,354 @@ def write_analysis_sheet(workbook: Any, source: Path, rows_read: int, rows_writt
             worksheet.insert_chart(chart_start + 69, 0, chiller_chart, {"x_scale": 1.4, "y_scale": 1.0})
 
 
-def process_xlsx(source: Path, output_dir: Path, progress: Any) -> ProcessResult:
+def equipment_is_running_now(state: EquipmentState, analysis: TrendAnalysis) -> bool:
+    return any(analysis.previous_states.get(index) == 1 for index in state.status_columns)
+
+
+def equipment_trip_count(state: EquipmentState, analysis: TrendAnalysis) -> int:
+    return sum(
+        1
+        for period in state.periods
+        if (meta := next((item for item in analysis.metas if item.name == period.column), None))
+        and meta.is_alarm
+        and period.state == 1
+    )
+
+
+def operator_equipment_rows(analysis: TrendAnalysis) -> list[list[Any]]:
+    preferred_order = {
+        "Chiller": 0,
+        "AHU": 1,
+        "FCU": 2,
+        "CHWP": 3,
+        "CDWP": 4,
+        "Cooling Tower": 5,
+        "Pump": 6,
+        "Fan": 7,
+        "VSD": 8,
+        "Power Meter": 9,
+    }
+    grouped: dict[str, list[EquipmentState]] = {}
+    for state in analysis.equipment.values():
+        if state.equipment == "Unknown Equipment" or state.equipment_type in {"Unknown", "Valve"}:
+            continue
+        grouped.setdefault(state.equipment_type, []).append(state)
+    rows: list[list[Any]] = []
+    for equipment_type, states in sorted(grouped.items(), key=lambda item: (preferred_order.get(item[0], 99), item[0])):
+        running = sum(1 for state in states if equipment_is_running_now(state, analysis))
+        operated = sum(1 for state in states if equipment_on_minutes(state) > 0)
+        trips = sum(equipment_trip_count(state, analysis) for state in states)
+        status = "Attention required" if trips else ("Running" if running else ("Stopped now" if operated else "No run detected"))
+        rows.append([equipment_type, len(states), operated, running, trips, status])
+    return rows
+
+
+def display_percent(value: float | None, maximum: float | None) -> float | None:
+    if value is None:
+        return None
+    return value * 100 if maximum is not None and maximum <= 1.5 else value
+
+
+def operator_valve_rows(analysis: TrendAnalysis) -> list[list[Any]]:
+    rows: list[list[Any]] = []
+    for analog in analysis.analogs.values():
+        if analog.metric not in {"valve_command", "valve_feedback"} or not analog.count:
+            continue
+        rows.append([
+            analog.equipment,
+            analog.column,
+            "Feedback" if analog.metric == "valve_feedback" else "Command",
+            display_percent(analog.latest, analog.maximum),
+            display_percent(analog.mean, analog.maximum),
+            display_percent(analog.minimum, analog.maximum),
+            display_percent(analog.maximum, analog.maximum),
+        ])
+    return sorted(rows, key=lambda item: (item[0], item[1]))
+
+
+def temperature_position(column: str) -> str:
+    text = compact_name(column)
+    if any(token in text for token in ["entering", "return", "inlet", "chwr", "ewt", "rat"]):
+        return "IN / Return"
+    if any(token in text for token in ["leaving", "supply", "outlet", "chws", "lwt", "sat"]):
+        return "OUT / Supply"
+    return "Temperature"
+
+
+def operator_temperature_rows(analysis: TrendAnalysis) -> list[list[Any]]:
+    rows: list[list[Any]] = []
+    for analog in analysis.analogs.values():
+        if analog.metric != "temperature" or not analog.count:
+            continue
+        rows.append([
+            analog.equipment,
+            analog.column,
+            temperature_position(analog.column),
+            analog.latest,
+            analog.mean,
+            analog.minimum,
+            analog.maximum,
+        ])
+    return sorted(rows, key=lambda item: (item[0], item[2], item[1]))
+
+
+def operator_vsd_rows(analysis: TrendAnalysis) -> list[list[Any]]:
+    rows: list[list[Any]] = []
+    for analog in analysis.analogs.values():
+        if analog.metric not in {"frequency", "vsd_feedback", "vsd_command"} or not analog.count:
+            continue
+        rows.append([
+            analog.equipment,
+            analog.column,
+            "Feedback" if analog.metric == "vsd_feedback" else ("Command" if analog.metric == "vsd_command" else "Frequency"),
+            analog.latest,
+            analog.mean,
+            analog.minimum,
+            analog.maximum,
+        ])
+    return sorted(rows, key=lambda item: (item[0], item[1]))
+
+
+def operator_trip_rows(analysis: TrendAnalysis) -> list[list[Any]]:
+    meta_by_name = {meta.name: meta for meta in analysis.metas}
+    rows: list[list[Any]] = []
+    for state in analysis.equipment.values():
+        for period in state.periods:
+            meta = meta_by_name.get(period.column)
+            if not meta or not meta.is_alarm or period.state != 1:
+                continue
+            still_active = analysis.previous_states.get(meta.index) == 1
+            rows.append([
+                period.equipment,
+                meta.metric.replace("_", " ").title(),
+                period.column,
+                format_dt(period.start_time),
+                "Still active" if still_active else format_dt(period.end_time),
+                format_duration(period_duration_minutes(period)),
+                "ACTIVE" if still_active else "Recovered",
+            ])
+    return sorted(rows, key=lambda item: item[3] or "")
+
+
+def operator_cooling_rows(analysis: TrendAnalysis) -> list[list[Any]]:
+    duration_hours = trend_duration_minutes(analysis) / 60
+    rows: list[list[Any]] = []
+    for summary in analysis.chiller_loads.values():
+        average_rt = avg(summary.rt_sum, summary.rt_count)
+        rows.append([
+            summary.chiller,
+            average_rt,
+            summary.rt_max,
+            summary.rt_latest,
+            average_rt * duration_hours if average_rt is not None else None,
+            avg(summary.dt_sum, summary.samples),
+            summary.dt_max,
+            avg(summary.load_pct_sum, summary.load_pct_count),
+            summary.load_pct_max,
+            chiller_load_status(summary),
+        ])
+    return rows
+
+
+def write_operator_table(
+    worksheet: Any,
+    row: int,
+    title: str,
+    headers: list[str],
+    values: list[list[Any]],
+    formats: dict[str, Any],
+    empty_message: str,
+    number_columns: set[int] | None = None,
+) -> int:
+    number_columns = number_columns or set()
+    worksheet.merge_range(row, 0, row, max(len(headers) - 1, 0), title, formats["section"])
+    row += 1
+    for col, header in enumerate(headers):
+        worksheet.write(row, col, header, formats["header"])
+    row += 1
+    if not values:
+        worksheet.merge_range(row, 0, row, max(len(headers) - 1, 0), empty_message, formats["muted"])
+        return row + 2
+    for values_row in values:
+        for col, value in enumerate(values_row):
+            cell_format = formats["number"] if col in number_columns and isinstance(value, (int, float)) else formats["value"]
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                worksheet.write_number(row, col, value, cell_format)
+            else:
+                worksheet.write(row, col, value if value is not None else "Not available", cell_format)
+        row += 1
+    return row + 1
+
+
+def write_analysis_sheet(workbook: Any, source: Path, rows_read: int, rows_written: int, analysis: TrendAnalysis, output_kind: str) -> None:
+    worksheet = workbook.add_worksheet("Analysis")
+    title = workbook.add_format({"bold": True, "font_size": 18, "font_color": "white", "bg_color": "#0F172A", "align": "center", "valign": "vcenter"})
+    subtitle = workbook.add_format({"font_size": 11, "font_color": "#334155", "bg_color": "#E2E8F0", "align": "center", "valign": "vcenter"})
+    section = workbook.add_format({"bold": True, "font_size": 12, "font_color": "white", "bg_color": "#1D4ED8", "border": 1})
+    header = workbook.add_format({"bold": True, "font_color": "white", "bg_color": "#475569", "border": 1, "text_wrap": True, "valign": "vcenter"})
+    value = workbook.add_format({"border": 1, "text_wrap": True, "valign": "top"})
+    number = workbook.add_format({"border": 1, "num_format": "#,##0.00", "valign": "top"})
+    muted = workbook.add_format({"border": 1, "font_color": "#64748B", "bg_color": "#F8FAFC", "italic": True})
+    label = workbook.add_format({"bold": True, "font_color": "#334155", "bg_color": "#F1F5F9", "border": 1})
+    formats = {"section": section, "header": header, "value": value, "number": number, "muted": muted}
+
+    worksheet.hide_gridlines(2)
+    worksheet.freeze_panes(3, 0)
+    worksheet.set_row(0, 30)
+    worksheet.set_row(1, 24)
+    worksheet.set_column("A:A", 22)
+    worksheet.set_column("B:B", 34)
+    worksheet.set_column("C:C", 20)
+    worksheet.set_column("D:J", 18)
+    worksheet.merge_range("A1:J1", "Daily ACMV Operation Summary", title)
+    worksheet.merge_range(
+        "A2:J2",
+        f"{source.name} | {format_dt(analysis.first_timestamp)} to {format_dt(analysis.last_timestamp)}",
+        subtitle,
+    )
+
+    trip_rows = operator_trip_rows(analysis)
+    equipment_rows = operator_equipment_rows(analysis)
+    total_equipment = sum(int(row[1]) for row in equipment_rows)
+    running_now = sum(int(row[3]) for row in equipment_rows)
+    operated_today = sum(int(row[2]) for row in equipment_rows)
+    active_trips = sum(1 for row in trip_rows if row[6] == "ACTIVE")
+    summary = [
+        ("Equipment detected", total_equipment),
+        ("Ran during this file period", operated_today),
+        ("Running at latest reading", running_now),
+        ("Trip/fault occurrences", len(trip_rows)),
+        ("Trips still active", active_trips),
+        ("Rows analyzed", rows_read),
+        ("Detected CSV columns", len(analysis.headers)),
+        ("Analysis note", "Values are based only on points available in this CSV."),
+    ]
+    row = 3
+    for index, (name, summary_value) in enumerate(summary):
+        col = 0 if index < 4 else 5
+        summary_row = row + (index if index < 4 else index - 4)
+        worksheet.write(summary_row, col, name, label)
+        if isinstance(summary_value, (int, float)) and not isinstance(summary_value, bool):
+            worksheet.write_number(summary_row, col + 1, summary_value, value)
+        else:
+            worksheet.write(summary_row, col + 1, summary_value, value)
+    row = 8
+
+    row = write_operator_table(
+        worksheet,
+        row,
+        "1. Equipment Running Summary",
+        ["Equipment type", "Detected", "Ran today", "Running now", "Trip count", "Current summary"],
+        equipment_rows,
+        formats,
+        "No AHU, chiller, pump, cooling tower, FCU, fan, or VSD equipment could be identified from the CSV headers.",
+    )
+    row = write_operator_table(
+        worksheet,
+        row,
+        "2. Valve Opening (%)",
+        ["Equipment", "Valve point", "Value type", "Latest %", "Average %", "Minimum %", "Maximum %"],
+        operator_valve_rows(analysis),
+        formats,
+        "No valve command or valve feedback percentage points were found.",
+        {3, 4, 5, 6},
+    )
+    row = write_operator_table(
+        worksheet,
+        row,
+        "3. Temperature IN / OUT",
+        ["Equipment", "Temperature point", "Position", "Latest", "Average", "Minimum", "Maximum"],
+        operator_temperature_rows(analysis),
+        formats,
+        "No temperature points were found.",
+        {3, 4, 5, 6},
+    )
+    row = write_operator_table(
+        worksheet,
+        row,
+        "4. VSD / Frequency (Hz)",
+        ["Equipment", "VSD point", "Value type", "Latest Hz", "Average Hz", "Minimum Hz", "Maximum Hz"],
+        operator_vsd_rows(analysis),
+        formats,
+        "No VSD frequency, command, or feedback points were found.",
+        {3, 4, 5, 6},
+    )
+    row = write_operator_table(
+        worksheet,
+        row,
+        "5. Trip / Fault Timeline",
+        ["Equipment", "Event", "Point", "Trip started", "Recovered at", "Duration", "Status"],
+        trip_rows,
+        formats,
+        "No trip, lockout, fail, overload, or alarm event was detected.",
+    )
+    row = write_operator_table(
+        worksheet,
+        row,
+        "6. Chiller Cooling Load",
+        ["Chiller", "Average RT", "Peak RT", "Latest RT", "Estimated ton-hours", "Average CHW ΔT", "Peak CHW ΔT", "Average load %", "Peak load %", "Calculation status"],
+        operator_cooling_rows(analysis),
+        formats,
+        "Cooling load RT is not available. The CSV must contain mapped CHW flow plus entering/return and leaving/supply water temperatures.",
+        {1, 2, 3, 4, 5, 6, 7, 8},
+    )
+    row = write_operator_table(
+        worksheet,
+        row,
+        "7. Data Quality / Missing Information",
+        ["Check", "Finding", "Severity"],
+        data_quality_rows(analysis)[:30],
+        formats,
+        "No major data quality issue was detected.",
+    )
+
+    worksheet.set_landscape()
+    worksheet.fit_to_pages(1, 0)
+    worksheet.print_area(0, 0, max(row - 1, 1), 9)
+    worksheet.set_header("&CDaily ACMV Operation Summary")
+    worksheet.set_footer("&LGenerated from CSV&RPage &P of &N")
+
+
+def process_xlsx(source: Path, output_path: Path, progress: Any) -> ProcessResult:
     import xlsxwriter
 
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     progress(0, "Detecting CSV delimiter")
     encoding, delimiter, col_count, headers = detect_csv_properties(source)
     progress(0, "Parsing CSV columns", delimiter=delimiter, columns=col_count)
     progress(0, "Writing Data sheet")
 
-    output_path = output_dir / f"{source.stem}.xlsx"
     workbook = xlsxwriter.Workbook(output_path, {"constant_memory": True, "strings_to_urls": False, "use_zip64": True})
     header_format = workbook.add_format({"bold": True, "bg_color": "#1F2937", "font_color": "white", "border": 1})
 
     iterator = iter_csv(source, encoding, delimiter)
     next(iterator, None) # Skip header row
 
-    stats, counters = new_stats(headers)
     analysis = build_analyzer(headers)
     analysis.bucket_size_rows = estimate_initial_bucket_size(source)
     analysis.summary_mode = source.stat().st_size > 50 * 1024 * 1024 or len(headers) > 500
-    sheet_index = 1
     rows_on_sheet = 0
     rows_read = 0
     total_rows_written = 0
 
-    def add_sheet(index: int):
-        worksheet = workbook.add_worksheet(f"Data_{index}")
+    def add_sheet():
+        worksheet = workbook.add_worksheet("Data")
         for col, header in enumerate(headers):
             worksheet.write(0, col, header, header_format)
             worksheet.set_column(col, col, min(max(len(header) + 2, 12), 32))
         worksheet.freeze_panes(1, 0)
         return worksheet
 
-    worksheet = add_sheet(sheet_index)
+    worksheet = add_sheet()
     for raw_row in iterator:
         rows_read += 1
         if rows_on_sheet >= EXCEL_DATA_ROWS_PER_SHEET:
-            sheet_index += 1
-            worksheet = add_sheet(sheet_index)
-            rows_on_sheet = 0
+            workbook.close()
+            output_path.unlink(missing_ok=True)
+            raise ValueError(
+                f"CSV exceeds the single Data sheet limit of {EXCEL_DATA_ROWS_PER_SHEET:,} rows."
+            )
         row = fit_row(raw_row, len(headers))
-        update_profiles(row, stats, counters)
         update_analysis(analysis, row)
         excel_row = rows_on_sheet + 1
         for col, value in enumerate(row):
@@ -2069,120 +2245,12 @@ def process_xlsx(source: Path, output_dir: Path, progress: Any) -> ProcessResult
     write_analysis_sheet(workbook, source, rows_read, total_rows_written, analysis, "xlsx")
     workbook.close()
     progress(rows_read, "Workbook created.")
-    report = build_report(source, rows_read, [output_path], stats, counters)
-    return ProcessResult(rows_read=rows_read, output_files=[output_path], report=report)
+    return ProcessResult(rows_read=rows_read, output_path=output_path)
 
 
-def process_sqlite(source: Path, output_dir: Path, progress: Any) -> ProcessResult:
-    progress(0, "Detecting CSV delimiter")
-    encoding, delimiter, col_count, headers = detect_csv_properties(source)
-    progress(0, "Parsing CSV columns", delimiter=delimiter, columns=col_count)
-    progress(0, "Writing Data sheet")
-
-    output_path = output_dir / f"{source.stem}.sqlite"
-    iterator = iter_csv(source, encoding, delimiter)
-    next(iterator, None) # Skip header row
-
-    stats, counters = new_stats(headers)
-    column_names = unique_sql_names(headers)
-    table = "trend_data"
-    conn = sqlite3.connect(output_path)
-    quoted_table = quote_sqlite_identifier(table)
-    conn.execute(f"DROP TABLE IF EXISTS {quoted_table}")
-    conn.execute(f"CREATE TABLE {quoted_table} ({', '.join(f'{quote_sqlite_identifier(name)} TEXT' for name in column_names)})")
-    placeholders = ",".join("?" for _ in column_names)
-    rows_read = 0
-    batch: list[list[str]] = []
-    for raw_row in iterator:
-        rows_read += 1
-        row = fit_row(raw_row, len(headers))
-        update_profiles(row, stats, counters)
-        batch.append(row)
-        if len(batch) >= 5000:
-            conn.executemany(f"INSERT INTO {quoted_table} VALUES ({placeholders})", batch)
-            conn.commit()
-            batch.clear()
-            progress(rows_read)
-    if batch:
-        conn.executemany(f"INSERT INTO {quoted_table} VALUES ({placeholders})", batch)
-    conn.execute("CREATE TABLE conversion_report (key TEXT, value TEXT)")
-    conn.executemany(
-        "INSERT INTO conversion_report VALUES (?, ?)",
-        [("source_file", source.name), ("rows_read", str(rows_read)), ("columns", str(len(headers)))],
-    )
-    conn.commit()
-    conn.close()
-    progress(rows_read)
-    report = build_report(source, rows_read, [output_path], stats, counters)
-    return ProcessResult(rows_read=rows_read, output_files=[output_path], report=report)
-
-
-def process_parquet(source: Path, output_dir: Path, progress: Any) -> ProcessResult:
-    try:
-        import pyarrow as pa
-        import pyarrow.parquet as pq
-    except ImportError as exc:
-        raise RuntimeError("Parquet output requires pyarrow on the backend. Install backend requirements with pyarrow enabled.") from exc
-
-    progress(0, "Detecting CSV delimiter")
-    encoding, delimiter, col_count, headers = detect_csv_properties(source)
-    progress(0, "Parsing CSV columns", delimiter=delimiter, columns=col_count)
-    progress(0, "Writing Data sheet")
-
-    output_path = output_dir / f"{source.stem}.parquet"
-    iterator = iter_csv(source, encoding, delimiter)
-    next(iterator, None) # Skip header row
-
-    stats, counters = new_stats(headers)
-    writer: pq.ParquetWriter | None = None
-    rows_read = 0
-    batch_rows: list[list[str]] = []
-    try:
-        for raw_row in iterator:
-            rows_read += 1
-            row = fit_row(raw_row, len(headers))
-            update_profiles(row, stats, counters)
-            batch_rows.append(row)
-            if len(batch_rows) >= 20000:
-                columns = {header: [item[index] for item in batch_rows] for index, header in enumerate(headers)}
-                table = pa.table(columns)
-                if writer is None:
-                    writer = pq.ParquetWriter(output_path, table.schema)
-                writer.write_table(table)
-                batch_rows.clear()
-                progress(rows_read)
-        if batch_rows:
-            columns = {header: [item[index] for item in batch_rows] for index, header in enumerate(headers)}
-            table = pa.table(columns)
-            if writer is None:
-                writer = pq.ParquetWriter(output_path, table.schema)
-            writer.write_table(table)
-    finally:
-        if writer is not None:
-            writer.close()
-    report = build_report(source, rows_read, [output_path], stats, counters)
-    progress(rows_read)
-    return ProcessResult(rows_read=rows_read, output_files=[output_path], report=report)
-
-
-def process_csv(source: Path, output_dir: Path, output_format: OutputFormat, progress: Any) -> Path:
-    output_dir.mkdir(parents=True, exist_ok=True)
-    if output_format == "xlsx":
-        result = process_xlsx(source, output_dir, progress)
-    elif output_format == "sqlite":
-        result = process_sqlite(source, output_dir, progress)
-    elif output_format == "parquet":
-        result = process_parquet(source, output_dir, progress)
-    else:
+def process_csv(source: Path, output_path: Path, output_format: OutputFormat, progress: Any) -> Path:
+    if output_format != "xlsx":
         raise ValueError(f"Unsupported output format: {output_format}")
-
-    report_path = output_dir / "conversion_report.txt"
-    report_path.write_text(result.report, encoding="utf-8")
-    archive_path = output_dir / f"{source.stem}-{output_format}.zip"
-    progress(result.rows_read, "Creating output ZIP.")
-    with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_DEFLATED, allowZip64=True) as archive:
-        for output_file in result.output_files:
-            archive.write(output_file, output_file.name)
-        archive.write(report_path, report_path.name)
-    progress(result.rows_read, "Completed ZIP output.")
-    return archive_path
+    result = process_xlsx(source, output_path, progress)
+    progress(result.rows_read, "Completed Excel output.")
+    return result.output_path

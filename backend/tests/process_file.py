@@ -10,7 +10,6 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("csv_path")
     parser.add_argument("--out", default="/tmp/csv-fast-view-output")
-    parser.add_argument("--format", choices=["xlsx", "sqlite", "parquet"], default="xlsx")
     args = parser.parse_args()
 
     def progress(rows: int, message: str | None = None, *args, **kwargs) -> None:
@@ -19,9 +18,10 @@ def main() -> int:
         elif rows % 100000 == 0:
             print(f"processed {rows:,} rows")
 
-    archive = process_csv(Path(args.csv_path), Path(args.out), args.format, progress)
-    print(archive)
-    print(archive.stat().st_size)
+    output_path = Path(args.out) / f"{Path(args.csv_path).stem}.xlsx"
+    output = process_csv(Path(args.csv_path), output_path, "xlsx", progress)
+    print(output)
+    print(output.stat().st_size)
     return 0
 
 

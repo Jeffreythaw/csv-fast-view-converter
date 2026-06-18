@@ -56,6 +56,7 @@ class Job:
     download_url: str | None = None
     upload_path: str | None = None
     output_path: str | None = None
+    output_filename: str | None = None
     cleanup_paths: list[str] = field(default_factory=list)
     detected_delimiter: str | None = None
     detected_columns: int | None = None
@@ -112,6 +113,10 @@ def read_job(job_id: str) -> Job | None:
         data.setdefault("total_files", 1)
         data.setdefault("processed_files", 0)
         data.setdefault("traceback", None)
+        data.setdefault(
+            "output_filename",
+            f"{Path(data.get('filename') or 'output.csv').stem}.xlsx",
+        )
         allowed = {item.name for item in fields(Job)}
         job = Job(**{key: value for key, value in data.items() if key in allowed})
         jobs[job_id] = job
@@ -143,7 +148,7 @@ def public_job(job: Job) -> dict:
         if output_exists and output_size > 0 and output_readable:
             job.status = "completed"
             job.current_step = "completed"
-            job.message = "Conversion completed. Output ZIP is ready to download."
+            job.message = "Conversion completed. Excel file is ready to download."
             job.download_url = f"/api/jobs/{job.id}/download"
             write_job(job)
 
@@ -227,27 +232,22 @@ def run_processing(job_id: str) -> None:
             logger.info("Job progress job_id=%s rows=%s step=%s", job.id, rows, step)
 
     try:
-        work_dir = OUTPUT_DIR / job.id
-        final_archive = (OUTPUT_DIR / f"{job.id}.zip").resolve()
-        if final_archive.exists():
-            final_archive.unlink()
-        archive = process_csv(Path(job.upload_path or ""), work_dir, job.output_format, progress).resolve()
-        archive_exists = archive.exists()
-        archive_size = archive.stat().st_size if archive_exists else 0
-        if not archive_exists or archive_size <= 0:
-            raise RuntimeError(f"Output ZIP was not created correctly: {archive}")
-        shutil.move(str(archive), final_archive)
+        final_output = (OUTPUT_DIR / f"{job.id}.xlsx").resolve()
+        final_output.unlink(missing_ok=True)
+        output = process_csv(Path(job.upload_path or ""), final_output, job.output_format, progress).resolve()
+        output_exists = output.exists()
+        output_size = output.stat().st_size if output_exists else 0
+        if not output_exists or output_size <= 0:
+            raise RuntimeError(f"Excel output was not created correctly: {output}")
         job.status = "completed"
         job.current_step = "completed"
-        job.output_path = str(final_archive)
+        job.output_path = str(output)
         job.download_url = f"/api/jobs/{job.id}/download"
         job.processed_files = 1
-        job.message = "Conversion completed. Output ZIP is ready to download."
-        if str(work_dir) not in job.cleanup_paths:
-            job.cleanup_paths.append(str(work_dir))
-        if str(final_archive) not in job.cleanup_paths:
-            job.cleanup_paths.append(str(final_archive))
-        logger.info("Processing completed job_id=%s output_zip_path=%s output_size=%s", job.id, final_archive, final_archive.stat().st_size)
+        job.message = "Conversion completed. Excel file is ready to download."
+        if str(output) not in job.cleanup_paths:
+            job.cleanup_paths.append(str(output))
+        logger.info("Processing completed job_id=%s output_path=%s output_size=%s", job.id, output, output.stat().st_size)
     except Exception as exc:
         job.status = "failed"
         job.current_step = "failed"
@@ -269,7 +269,11 @@ def startup() -> None:
 
 @app.get("/api/health")
 def health() -> dict:
-    return {"ok": True, "service": "csv-fast-view-converter-api"}
+    return {
+        "ok": True,
+        "service": "csv-fast-view-converter-api",
+        "version": "direct-xlsx-operator-summary-v2",
+    }
 
 
 @app.post("/api/jobs")
@@ -279,10 +283,15 @@ async def create_job(
 ) -> dict:
     ensure_dirs()
     cleanup_expired_jobs()
+    if output_format != "xlsx":
+        raise HTTPException(status_code=400, detail="Only XLSX output is supported.")
+    original_filename = Path(file.filename or "upload.csv").name or "upload.csv"
+    if Path(original_filename).suffix.lower() != ".csv":
+        raise HTTPException(status_code=400, detail="Upload one CSV file.")
     job_id = uuid.uuid4().hex
     job_dir = UPLOAD_DIR / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
-    upload_path = job_dir / (Path(file.filename or "upload.csv").name or "upload.csv")
+    upload_path = job_dir / original_filename
     job = Job(
         id=job_id,
         job_id=job_id,
@@ -293,6 +302,7 @@ async def create_job(
         current_step="uploaded",
         current_file=file.filename,
         filename=file.filename,
+        output_filename=f"{Path(original_filename).stem}.xlsx",
         upload_path=str(upload_path.resolve()),
         cleanup_paths=[str(job_dir.resolve())],
         message="Uploading CSV file.",
@@ -372,7 +382,7 @@ def download_job(job_id: str) -> FileResponse:
     output_path = Path(job.output_path)
     output_exists, output_size, output_readable = output_state(job)
     logger.info(
-        "Download check job_id=%s output_zip_path=%s output_exists=%s output_size=%s output_readable=%s",
+        "Download check job_id=%s output_path=%s output_exists=%s output_size=%s output_readable=%s",
         job_id,
         output_path,
         output_exists,
@@ -383,7 +393,7 @@ def download_job(job_id: str) -> FileResponse:
         raise HTTPException(
             status_code=404,
             detail={
-                "message": "Output ZIP is missing, empty, or not readable. It may have expired or the backend instance restarted.",
+                "message": "Excel output is missing, empty, or not readable. It may have expired or the backend instance restarted.",
                 "job_id": job_id,
                 "status": job.status,
                 "output_exists": output_exists,
@@ -391,7 +401,11 @@ def download_job(job_id: str) -> FileResponse:
                 "output_readable": output_readable,
             },
         )
-    return FileResponse(output_path, filename=output_path.name, media_type="application/zip")
+    return FileResponse(
+        output_path,
+        filename=job.output_filename or f"{Path(job.filename or 'output.csv').stem}.xlsx",
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
 
 
 @app.delete("/api/jobs/{job_id}")

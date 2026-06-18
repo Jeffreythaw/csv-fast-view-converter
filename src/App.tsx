@@ -10,7 +10,7 @@ import {
   UploadCloud,
 } from 'lucide-react';
 
-type OutputFormat = 'xlsx' | 'sqlite' | 'parquet';
+type OutputFormat = 'xlsx';
 type JobStatus = 'queued' | 'uploading' | 'processing' | 'completed' | 'failed' | 'expired';
 
 interface QueueFile {
@@ -28,6 +28,7 @@ interface QueueFile {
   outputReady?: boolean;
   outputExists?: boolean;
   outputSize?: number;
+  outputFilename?: string;
   startedAt?: number;
   finishedAt?: number;
   detectedDelimiter?: string;
@@ -49,6 +50,7 @@ interface BackendJob {
   output_ready: boolean;
   output_exists: boolean;
   output_size: number;
+  output_filename?: string;
   detected_delimiter?: string;
   detected_columns?: number;
 }
@@ -147,7 +149,7 @@ export default function App() {
   const [outputFormat] = useState<OutputFormat>('xlsx');
   const [isRunning, setIsRunning] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
-  const [progressMessage, setProgressMessage] = useState('Select large BMS / ACMV CSV files, then upload to the processing backend.');
+  const [progressMessage, setProgressMessage] = useState('Select one BMS / ACMV CSV file, then upload it to the processing backend.');
 
   const totalSize = useMemo(() => files.reduce((sum, item) => sum + item.file.size, 0), [files]);
   const completedCount = files.filter(item => item.status === 'completed').length;
@@ -158,14 +160,14 @@ export default function App() {
   };
 
   const addFiles = (incoming: File[]) => {
-    const csvFiles = incoming.filter(file => file.name.toLowerCase().endsWith('.csv'));
-    if (csvFiles.length === 0) {
-      setErrorMessage('Select at least one .csv file.');
+    const csvFile = incoming.find(file => file.name.toLowerCase().endsWith('.csv'));
+    if (!csvFile) {
+      setErrorMessage('Select one .csv file.');
       return;
     }
-    setFiles(csvFiles.map(makeQueueItem));
+    setFiles([makeQueueItem(csvFile)]);
     setErrorMessage(null);
-    setProgressMessage(`${csvFiles.length} CSV file${csvFiles.length > 1 ? 's' : ''} selected. Ready to upload.`);
+    setProgressMessage(`${csvFile.name} selected. Ready to convert.`);
   };
 
   const handleFileChange = (event: ChangeEvent<HTMLInputElement>) => {
@@ -177,7 +179,7 @@ export default function App() {
     if (isRunning) return;
     setFiles([]);
     setErrorMessage(null);
-    setProgressMessage('Select large BMS / ACMV CSV files, then upload to the processing backend.');
+    setProgressMessage('Select one BMS / ACMV CSV file, then upload it to the processing backend.');
   };
 
   const downloadOutput = async (item: QueueFile) => {
@@ -199,14 +201,14 @@ export default function App() {
 
       const blob = await response.blob();
       if (blob.size === 0) {
-        const message = 'Download failed: backend returned an empty ZIP file.';
+        const message = 'Download failed: backend returned an empty Excel file.';
         updateFile(item.id, { error: message, downloadStatus: message });
         setErrorMessage(message);
         return;
       }
 
-      const fallbackName = `${item.file.name.replace(/\.csv$/i, '')}-${outputFormat}.zip`;
-      const filename = filenameFromDisposition(response.headers.get('Content-Disposition'), fallbackName);
+      const fallbackName = item.outputFilename || `${item.file.name.replace(/\.csv$/i, '')}.xlsx`;
+      const filename = item.outputFilename || filenameFromDisposition(response.headers.get('Content-Disposition'), fallbackName);
       const objectUrl = URL.createObjectURL(blob);
       const anchor = document.createElement('a');
       anchor.href = objectUrl;
@@ -244,6 +246,7 @@ export default function App() {
           outputReady: created.output_ready,
           outputExists: created.output_exists,
           outputSize: created.output_size,
+          outputFilename: created.output_filename,
           downloadUrl: `${API_BASE}/api/jobs/${created.id}/download`,
           uploadProgress: 100,
           detectedDelimiter: created.detected_delimiter,
@@ -261,6 +264,7 @@ export default function App() {
             outputReady: job.output_ready,
             outputExists: job.output_exists,
             outputSize: job.output_size,
+            outputFilename: job.output_filename,
             downloadUrl: `${API_BASE}/api/jobs/${job.id}/download`,
             detectedDelimiter: job.detected_delimiter,
             detectedColumns: job.detected_columns,
@@ -271,12 +275,13 @@ export default function App() {
           throw new Error(finalJob.error || (finalJob.status === 'expired' ? 'Job expired or backend restarted. Please retry.' : 'Backend conversion failed.'));
         }
         if (!finalJob.output_ready) {
-          throw new Error(`Backend marked the job completed, but the output ZIP is not ready. exists=${finalJob.output_exists}, size=${finalJob.output_size}`);
+          throw new Error(`Backend marked the job completed, but the Excel output is not ready. exists=${finalJob.output_exists}, size=${finalJob.output_size}`);
         }
         updateFile(item.id, {
           outputReady: finalJob.output_ready,
           outputExists: finalJob.output_exists,
           outputSize: finalJob.output_size,
+          outputFilename: finalJob.output_filename,
           downloadUrl: `${API_BASE}/api/jobs/${finalJob.id}/download`,
           finishedAt: Date.now(),
           detectedDelimiter: finalJob.detected_delimiter,
@@ -306,7 +311,7 @@ export default function App() {
             </div>
           </div>
           <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-xs font-semibold text-slate-600">
-            Backend: {API_BASE}
+            Direct XLSX • Single CSV
           </div>
         </div>
       </header>
@@ -315,9 +320,9 @@ export default function App() {
         <section className="lg:col-span-8">
           <div className="rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
             <div className="border-b border-slate-200 pb-5">
-              <h2 className="text-base font-semibold">Large CSV Job Upload</h2>
+              <h2 className="text-base font-semibold">Convert CSV to Excel</h2>
               <p className="mt-1 text-sm leading-6 text-slate-500">
-                Files upload to a dedicated backend worker. The backend streams upload data to disk and processes CSV rows without loading the full file into memory.
+                Select one CSV file. The result is one Excel file with Data and an easy-to-read daily operation summary.
               </p>
             </div>
 
@@ -327,11 +332,11 @@ export default function App() {
                 XLSX
               </span>
               <span className="mt-1 block text-xs leading-5 text-slate-500">
-                Excel workbook with streamed Data sheets and a BMS / ACMV operation analysis report.
+                Excel workbook with Data and Analysis sheets.
               </span>
             </div>
 
-            <input ref={inputRef} type="file" accept=".csv,text/csv" multiple className="hidden" onChange={handleFileChange} />
+            <input ref={inputRef} type="file" accept=".csv,text/csv" className="hidden" onChange={handleFileChange} />
             <button
               type="button"
               onClick={() => inputRef.current?.click()}
@@ -339,14 +344,14 @@ export default function App() {
               className="mt-5 inline-flex min-h-28 w-full items-center justify-center gap-3 rounded-lg border-2 border-dashed border-slate-300 bg-white px-4 py-6 text-sm font-semibold text-slate-900 hover:border-slate-900 disabled:opacity-40"
             >
               <UploadCloud className="h-5 w-5 text-blue-700" />
-              Select CSV Files
+              Select CSV File
             </button>
 
             <div className="mt-5 overflow-hidden rounded-lg border border-slate-200 bg-slate-50">
               <div className="flex flex-col gap-3 border-b border-slate-200 bg-white px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
                 <div>
-                  <p className="text-sm font-semibold">Selected Jobs</p>
-                  <p className="text-xs text-slate-500">{files.length} file(s), {formatBytes(totalSize)} total</p>
+                  <p className="text-sm font-semibold">Selected File</p>
+                  <p className="text-xs text-slate-500">{files.length ? formatBytes(totalSize) : 'No file selected'}</p>
                 </div>
                 {files.length > 0 && (
                   <button
@@ -362,7 +367,7 @@ export default function App() {
               </div>
 
               {files.length === 0 ? (
-                <div className="px-4 py-10 text-center text-sm text-slate-500">No CSV files selected yet.</div>
+                <div className="px-4 py-10 text-center text-sm text-slate-500">No CSV file selected yet.</div>
               ) : (
                 <div className="max-h-[460px] divide-y divide-slate-200 overflow-auto">
                   {files.map(item => (
@@ -384,12 +389,10 @@ export default function App() {
                           {item.error && <p className="mt-1 text-xs text-rose-600">{item.error}</p>}
                           {item.jobId && (
                             <div className="mt-2 space-y-1 rounded-lg bg-white p-2 text-[11px] leading-4 text-slate-500">
-                              <p className="break-all"><span className="font-semibold text-slate-700">Job ID:</span> {item.jobId}</p>
-                              <p className="break-all"><span className="font-semibold text-slate-700">Download URL:</span> {item.downloadUrl || `${API_BASE}/api/jobs/${item.jobId}/download`}</p>
-                              <p>
-                                <span className="font-semibold text-slate-700">Output:</span>{' '}
-                                ready={String(Boolean(item.outputReady))}, exists={String(Boolean(item.outputExists))}, size={formatBytes(item.outputSize || 0)}
-                              </p>
+                              {item.outputFilename && (
+                                <p className="break-all"><span className="font-semibold text-slate-700">Excel file:</span> {item.outputFilename}</p>
+                              )}
+                              {item.outputReady && <p><span className="font-semibold text-slate-700">File size:</span> {formatBytes(item.outputSize || 0)}</p>}
                               {item.downloadStatus && <p className="break-all"><span className="font-semibold text-slate-700">Download status:</span> {item.downloadStatus}</p>}
                               {(item.detectedDelimiter !== undefined || item.detectedColumns !== undefined) && (
                                 <p>
@@ -430,7 +433,7 @@ export default function App() {
                           className="mt-3 inline-flex items-center gap-2 rounded-lg bg-emerald-600 px-3 py-2 text-xs font-semibold text-white hover:bg-emerald-700 disabled:cursor-not-allowed disabled:opacity-40"
                         >
                           <Download className="h-4 w-4" />
-                          Download Output ZIP
+                          Download Excel
                         </button>
                       )}
                     </div>
@@ -446,7 +449,7 @@ export default function App() {
               className="mt-5 inline-flex w-full items-center justify-center gap-2 rounded-lg bg-slate-900 px-4 py-3 text-sm font-semibold text-white hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-40"
             >
               {isRunning ? <Loader2 className="h-4 w-4 animate-spin" /> : <UploadCloud className="h-4 w-4" />}
-              {isRunning ? 'Running Jobs...' : `Upload and Process as ${outputFormat.toUpperCase()}`}
+              {isRunning ? 'Converting...' : 'Convert'}
             </button>
           </div>
         </section>
@@ -472,7 +475,7 @@ export default function App() {
 
             <div className="mt-5 grid grid-cols-3 gap-3 text-center">
               <div className="rounded-lg bg-slate-50 p-3">
-                <p className="text-xs text-slate-500">Jobs</p>
+                <p className="text-xs text-slate-500">Files</p>
                 <p className="mt-1 text-lg font-bold">{files.length}</p>
               </div>
               <div className="rounded-lg bg-emerald-50 p-3">
@@ -486,7 +489,7 @@ export default function App() {
             </div>
 
             <div className="mt-5 rounded-lg border border-slate-200 bg-slate-50 p-3 text-xs leading-5 text-slate-600">
-              Deploy the backend on a long-running host such as Render, Fly.io, Railway, ECS, or a VM. Set <code className="font-mono">VITE_API_BASE</code> on Vercel to that backend URL.
+              Output: one XLSX file containing only <strong>Data</strong> and <strong>Analysis</strong> sheets. No ZIP and no conversion report.
             </div>
           </div>
         </aside>
