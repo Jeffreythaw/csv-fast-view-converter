@@ -2200,12 +2200,8 @@ def process_xlsx(source: Path, output_path: Path, progress: Any) -> ProcessResul
     iterator = iter_csv(source, encoding, delimiter)
     next(iterator, None) # Skip header row
 
-    analysis = build_analyzer(headers)
-    analysis.bucket_size_rows = estimate_initial_bucket_size(source)
-    analysis.summary_mode = source.stat().st_size > 50 * 1024 * 1024 or len(headers) > 500
     rows_on_sheet = 0
     rows_read = 0
-    total_rows_written = 0
 
     def add_sheet():
         worksheet = workbook.add_worksheet("Data")
@@ -2225,7 +2221,6 @@ def process_xlsx(source: Path, output_path: Path, progress: Any) -> ProcessResul
                 f"CSV exceeds the single Data sheet limit of {EXCEL_DATA_ROWS_PER_SHEET:,} rows."
             )
         row = fit_row(raw_row, len(headers))
-        update_analysis(analysis, row)
         excel_row = rows_on_sheet + 1
         for col, value in enumerate(row):
             number = parse_number(value)
@@ -2236,13 +2231,9 @@ def process_xlsx(source: Path, output_path: Path, progress: Any) -> ProcessResul
             else:
                 worksheet.write_blank(excel_row, col, None)
         rows_on_sheet += 1
-        total_rows_written += 1
         if rows_read % 10000 == 0:
-            progress(rows_read, f"Analyzing rows and writing Data sheet: {rows_read:,} rows.")
+            progress(rows_read, f"Writing Data sheet: {rows_read:,} rows.")
 
-    finalize_analysis(analysis)
-    progress(rows_read, "Writing Analysis sheet and creating charts.")
-    write_analysis_sheet(workbook, source, rows_read, total_rows_written, analysis, "xlsx")
     workbook.close()
     progress(rows_read, "Workbook created.")
     return ProcessResult(rows_read=rows_read, output_path=output_path)

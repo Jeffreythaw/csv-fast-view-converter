@@ -22,7 +22,7 @@ class TestXlsxOutput(unittest.TestCase):
     def tearDown(self) -> None:
         shutil.rmtree(self.test_dir)
 
-    def test_semicolon_csv_creates_direct_two_sheet_xlsx(self) -> None:
+    def test_semicolon_csv_creates_direct_data_only_xlsx(self) -> None:
         source = self.test_dir / "BlkB-FCU_16062026_01062026.csv"
         source.write_text(
             "DateTime;Time;Value1;Value2\n"
@@ -47,7 +47,7 @@ class TestXlsxOutput(unittest.TestCase):
             sheets = workbook.find(f"{{{MAIN_NS}}}sheets")
             self.assertIsNotNone(sheets)
             sheet_elements = list(sheets) if sheets is not None else []
-            self.assertEqual([sheet.attrib["name"] for sheet in sheet_elements], ["Data", "Analysis"])
+            self.assertEqual([sheet.attrib["name"] for sheet in sheet_elements], ["Data"])
 
             relationships = ElementTree.fromstring(workbook_zip.read("xl/_rels/workbook.xml.rels"))
             relationship_targets = {
@@ -65,48 +65,6 @@ class TestXlsxOutput(unittest.TestCase):
             self.assertIsNotNone(first_data_row)
             cells = list(first_data_row) if first_data_row is not None else []
             self.assertEqual(len(cells), 4)
-
-    def test_analysis_sheet_uses_operator_friendly_daily_sections(self) -> None:
-        source = self.test_dir / "daily-acmv.csv"
-        source.write_text(
-            "DateTime;AHU 1 Run Status;AHU 1 CHW Valve Feedback;AHU 1 Supply Temp;"
-            "AHU 1 Return Temp;AHU 1 VSD Feedback Hz;Chiller 1 Run Status;"
-            "Chiller 1 Trip;Chiller 1 CHW Return Temp;Chiller 1 CHW Supply Temp;"
-            "Chiller 1 CHW Flow gpm\n"
-            "18/06/2026 00:00:00;0;0;14;25;0;1;0;12;7;1200\n"
-            "18/06/2026 06:00:00;1;65;13;24;42;1;1;13;7;1250\n"
-            "18/06/2026 06:30:00;1;70;13;23;45;1;0;13;7;1250\n"
-            "18/06/2026 23:45:00;0;0;14;24;0;0;0;12;7;0\n",
-            encoding="utf-8",
-        )
-        output = self.test_dir / "daily-acmv.xlsx"
-
-        def progress(*_args, **_kwargs) -> None:
-            return None
-
-        process_csv(source, output, "xlsx", progress)
-
-        with zipfile.ZipFile(output) as workbook_zip:
-            analysis_xml = ElementTree.fromstring(workbook_zip.read("xl/worksheets/sheet2.xml"))
-            visible_text = " ".join(
-                node.text or ""
-                for node in analysis_xml.findall(f".//{{{MAIN_NS}}}t")
-            )
-            for expected in [
-                "Daily ACMV Operation Summary",
-                "Equipment Running Summary",
-                "Valve Opening (%)",
-                "Temperature IN / OUT",
-                "VSD / Frequency (Hz)",
-                "Trip / Fault Timeline",
-                "Chiller Cooling Load",
-                "Trip started",
-                "Recovered at",
-                "Average RT",
-                "Peak RT",
-            ]:
-                self.assertIn(expected, visible_text)
-
 
 if __name__ == "__main__":
     unittest.main()

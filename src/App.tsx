@@ -149,7 +149,7 @@ export default function App() {
   const [outputFormat] = useState<OutputFormat>('xlsx');
   const [isRunning, setIsRunning] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
-  const [progressMessage, setProgressMessage] = useState('Select one BMS / ACMV CSV file, then upload it to the processing backend.');
+  const [progressMessage, setProgressMessage] = useState('Select BMS / ACMV CSV files, then upload them to the processing backend.');
 
   const totalSize = useMemo(() => files.reduce((sum, item) => sum + item.file.size, 0), [files]);
   const completedCount = files.filter(item => item.status === 'completed').length;
@@ -160,14 +160,15 @@ export default function App() {
   };
 
   const addFiles = (incoming: File[]) => {
-    const csvFile = incoming.find(file => file.name.toLowerCase().endsWith('.csv'));
-    if (!csvFile) {
-      setErrorMessage('Select one .csv file.');
+    const csvFiles = incoming.filter(file => file.name.toLowerCase().endsWith('.csv'));
+    const skippedCount = incoming.length - csvFiles.length;
+    if (csvFiles.length === 0) {
+      setErrorMessage('Select .csv files.');
       return;
     }
-    setFiles([makeQueueItem(csvFile)]);
-    setErrorMessage(null);
-    setProgressMessage(`${csvFile.name} selected. Ready to convert.`);
+    setFiles(previous => [...previous, ...csvFiles.map(makeQueueItem)]);
+    setErrorMessage(skippedCount ? `${skippedCount} non-CSV file${skippedCount > 1 ? 's were' : ' was'} skipped.` : null);
+    setProgressMessage(`${csvFiles.length} CSV file${csvFiles.length > 1 ? 's' : ''} added. Ready to convert one by one.`);
   };
 
   const handleFileChange = (event: ChangeEvent<HTMLInputElement>) => {
@@ -179,7 +180,7 @@ export default function App() {
     if (isRunning) return;
     setFiles([]);
     setErrorMessage(null);
-    setProgressMessage('Select one BMS / ACMV CSV file, then upload it to the processing backend.');
+    setProgressMessage('Select BMS / ACMV CSV files, then upload them to the processing backend.');
   };
 
   const downloadOutput = async (item: QueueFile) => {
@@ -228,10 +229,15 @@ export default function App() {
 
   const runJobs = async () => {
     if (files.length === 0 || isRunning) return;
+    const pendingFiles = files.filter(item => item.status !== 'completed' && item.status !== 'processing' && item.status !== 'uploading' && item.status !== 'queued');
+    if (pendingFiles.length === 0) {
+      setProgressMessage('All selected files are already converted.');
+      return;
+    }
     setIsRunning(true);
     setErrorMessage(null);
 
-    for (const item of files) {
+    for (const item of pendingFiles) {
       try {
         updateFile(item.id, { status: 'uploading', uploadProgress: 0, error: undefined, message: 'Uploading file.' });
         updateFile(item.id, { startedAt: Date.now(), finishedAt: undefined });
@@ -311,7 +317,7 @@ export default function App() {
             </div>
           </div>
           <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-xs font-semibold text-slate-600">
-            Direct XLSX • Single CSV
+            Direct XLSX • One-by-one queue
           </div>
         </div>
       </header>
@@ -322,7 +328,7 @@ export default function App() {
             <div className="border-b border-slate-200 pb-5">
               <h2 className="text-base font-semibold">Convert CSV to Excel</h2>
               <p className="mt-1 text-sm leading-6 text-slate-500">
-                Select one CSV file. The result is one Excel file with Data and an easy-to-read daily operation summary.
+                Select multiple CSV files. Each CSV is converted separately into one Excel file.
               </p>
             </div>
 
@@ -332,11 +338,11 @@ export default function App() {
                 XLSX
               </span>
               <span className="mt-1 block text-xs leading-5 text-slate-500">
-                Excel workbook with Data and Analysis sheets.
+                Excel workbook with the CSV data sheet only.
               </span>
             </div>
 
-            <input ref={inputRef} type="file" accept=".csv,text/csv" className="hidden" onChange={handleFileChange} />
+            <input ref={inputRef} type="file" accept=".csv,text/csv" multiple className="hidden" onChange={handleFileChange} />
             <button
               type="button"
               onClick={() => inputRef.current?.click()}
@@ -344,14 +350,14 @@ export default function App() {
               className="mt-5 inline-flex min-h-28 w-full items-center justify-center gap-3 rounded-lg border-2 border-dashed border-slate-300 bg-white px-4 py-6 text-sm font-semibold text-slate-900 hover:border-slate-900 disabled:opacity-40"
             >
               <UploadCloud className="h-5 w-5 text-blue-700" />
-              Select CSV File
+              Select CSV Files
             </button>
 
             <div className="mt-5 overflow-hidden rounded-lg border border-slate-200 bg-slate-50">
               <div className="flex flex-col gap-3 border-b border-slate-200 bg-white px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
                 <div>
-                  <p className="text-sm font-semibold">Selected File</p>
-                  <p className="text-xs text-slate-500">{files.length ? formatBytes(totalSize) : 'No file selected'}</p>
+                  <p className="text-sm font-semibold">Selected Files</p>
+                  <p className="text-xs text-slate-500">{files.length ? `${files.length} file${files.length > 1 ? 's' : ''} • ${formatBytes(totalSize)}` : 'No files selected'}</p>
                 </div>
                 {files.length > 0 && (
                   <button
@@ -367,7 +373,7 @@ export default function App() {
               </div>
 
               {files.length === 0 ? (
-                <div className="px-4 py-10 text-center text-sm text-slate-500">No CSV file selected yet.</div>
+                <div className="px-4 py-10 text-center text-sm text-slate-500">No CSV files selected yet.</div>
               ) : (
                 <div className="max-h-[460px] divide-y divide-slate-200 overflow-auto">
                   {files.map(item => (
@@ -489,7 +495,7 @@ export default function App() {
             </div>
 
             <div className="mt-5 rounded-lg border border-slate-200 bg-slate-50 p-3 text-xs leading-5 text-slate-600">
-              Output: one XLSX file containing only <strong>Data</strong> and <strong>Analysis</strong> sheets. No ZIP and no conversion report.
+              Output: one XLSX file containing only the <strong>Data</strong> sheet. No Analysis sheet, ZIP, or conversion report.
             </div>
           </div>
         </aside>
